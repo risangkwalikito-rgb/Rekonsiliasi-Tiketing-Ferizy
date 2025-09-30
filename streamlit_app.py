@@ -1,154 +1,15 @@
-# app.py
+# streamlit_app.py
 # -*- coding: utf-8 -*-
-"""
-Rekonsiliasi: Tiket Detail vs Settlement Dana
-- Bulan & Tahun → tanggal 1..akhir bulan
-- Multi-file upload (Tiket Excel; Settlement CSV/Excel)
-- Tiket: gunakan kolom 'Created' (bukan 'Action date')
-  * Jika jam 00:00:00–00:59:59 → mundurkan hari: WIB=0, WITA=−1, WIT=−2
-  * Filter: St Bayar='paid' & Bank='ESPAY'
-- Settlement Dana ESPAY: pakai Transaction Date
-- Settlement Dana BCA/Non BCA: pakai Settlement Date (Product Name='BCA VA Online')
-- Pengambilan Tiket Detail: lewati baris-1 (merge header) saat baca Excel
-"""
+"""Rekonsiliasi: Tiket Detail vs Settlement Dana (gabungan, siap tempel)"""
 
-# --- Tambah di bagian import paling atas
-import io, os, zipfile, hashlib
-from typing import Iterable
-
-# --- Konfigurasi tipe file yang diterima
-SUPPORTED_EXTS = (".xlsx", ".xls", ".xlsb", ".csv", ".zip")
-
-def _file_key(uploaded_file) -> tuple:
-    """Key unik untuk cache: (nama, ukuran, type)."""
-    uploaded_file.seek(0, os.SEEK_END)
-    size = uploaded_file.tell()
-    uploaded_file.seek(0)
-    return (uploaded_file.name, size, getattr(uploaded_file, "type", ""))
-
-@st.cache_data(show_spinner=False)
-def _bytes_of(uploaded_file) -> bytes:
-    uploaded_file.seek(0)
-    data = uploaded_file.read()
-    uploaded_file.seek(0)
-    return data
-
-def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
-    return pd.read_csv(buf, encoding="utf-8-sig", sep=None, engine="python", dtype=str, na_filter=False)
-
-def _read_excel_by_ext(buf: io.BytesIO, name: str, *, header=None, skiprows=None) -> pd.DataFrame:
-    low = name.lower()
-    if low.endswith(".xlsb"):
-        # pip install pyxlsb
-        return pd.read_excel(buf, engine="pyxlsb", dtype=str, na_filter=False, header=header)
-    if low.endswith(".xlsx"):
-        return pd.read_excel(buf, engine="openpyxl", dtype=str, na_filter=False, header=header, skiprows=skiprows)
-    if low.endswith(".xls"):
-        # xlrd 1.2.0 masih mendukung .xls
-        return pd.read_excel(buf, engine="xlrd", dtype=str, na_filter=False, header=header, skiprows=skiprows)
-    raise ValueError(f"Ekstensi tidak didukung: {name}")
-
-def _extract_zip(uploaded_file) -> list[tuple[str, io.BytesIO]]:
-    """Kembalikan list (nama_file_dalam_zip, BytesIO)."""
-    data = _bytes_of(uploaded_file)
-    out = []
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            nm = info.filename
-            if not nm.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
-                continue
-            with zf.open(info) as f:
-                out.append((nm, io.BytesIO(f.read())))
-    return out
-
-def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
-    """Cari baris header paling cocok dalam 20 baris pertama."""
-    scan = min(20, len(df_no_header))
-    best_row, best_score = 0, -1
-    for i in range(scan):
-        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
-        text = " ".join(row.tolist())
-        score = sum(1 for t in targets if t in text)
-        if score > best_score:
-            best_row, best_score = i, score
-            if score >= 4:
-                break
-    return best_row
-
-def _read_tiket_any(uploaded_file) -> pd.DataFrame:
-    """Baca excel/csv/zip untuk Tiket. Skip judul merge & auto header detection."""
-    name = uploaded_file.name
-    if name.lower().endswith(".zip"):
-        frames = []
-        for nm, buf in _extract_zip(uploaded_file):
-            frames.append(_read_tiket_from_bytes(buf, nm))
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    else:
-        buf = io.BytesIO(_bytes_of(uploaded_file))
-        return _read_tiket_from_bytes(buf, name)
-
-def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
-    if name.lower().endswith(".csv"):
-        return _read_csv_fast(buf)
-    # 1) baca tanpa header untuk tebak baris header
-    raw = _read_excel_by_ext(buf, name, header=None)
-    if raw.empty:
-        return pd.DataFrame()
-    targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
-    header_row = _guess_header_row(raw, targets)
-    # 2) baca ulang dengan header=header_row
-    buf.seek(0)
-    df = _read_excel_by_ext(buf, name, header=header_row)
-    df["__source__"] = name
-    return df
-
-def _read_settle_any(uploaded_file) -> pd.DataFrame:
-    """Baca settlement (csv/xlsx/xls/xlsb/zip)."""
-    name = uploaded_file.name
-    if name.lower().endswith(".zip"):
-        frames = []
-        for nm, buf in _extract_zip(uploaded_file):
-            frames.append(_read_settle_from_bytes(buf, nm))
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    else:
-        buf = io.BytesIO(_bytes_of(uploaded_file))
-        return _read_settle_from_bytes(buf, name)
-
-def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
-    if name.lower().endswith(".csv"):
-        df = _read_csv_fast(buf)
-    else:
-        df = _read_excel_by_ext(buf, name, header=0)
-    df["__source__"] = name
-    return df
-
-# Ganti pemanggilan gabung file Anda menjadi:
-def _concat_tiket_files(files) -> pd.DataFrame:
-    frames = []
-    for f in (files or []):
-        df = _read_tiket_any(f)
-        if not df.empty:
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-def _concat_settle_files(files) -> pd.DataFrame:
-    frames = []
-    for f in (files or []):
-        df = _read_settle_any(f)
-        if not df.empty:
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-# Dan di file_uploader tambahkan tipe:
-# st.file_uploader(..., type=["xls","xlsx","xlsb","csv","zip"], accept_multiple_files=True)
-
+from __future__ import annotations  # harus di paling atas (setelah docstring)
 
 import io
+import os
 import re
+import zipfile
 import calendar
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Iterable
 
 import numpy as np
 import pandas as pd
@@ -156,9 +17,12 @@ import streamlit as st
 from dateutil import parser as dtparser
 
 
-# ---------------- Utilities ----------------
+# =========================
+# Utilities parsing & I/O
+# =========================
 
 def _parse_money(val) -> float:
+    """Robust parser: 1.234.567 | 50.300,00 | (1.000) | 1.000- | IDR 1,000 | -2.500."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return 0.0
     if isinstance(val, (int, float, np.number)):
@@ -167,18 +31,21 @@ def _parse_money(val) -> float:
     if not s:
         return 0.0
     neg = False
-    if s.startswith("(") and s.endswith(")"):
+    if s.startswith("(") and s.endswith(")"):  # (1.000)
         neg, s = True, s[1:-1].strip()
-    if s.endswith("-"):
+    if s.endswith("-"):                        # 1.000-
         neg, s = True, s[:-1].strip()
     s = re.sub(r"(idr|rp|cr|dr)", "", s, flags=re.IGNORECASE)
     s = re.sub(r"[^0-9\.,\-]", "", s).strip()
     if s.startswith("-"):
         neg, s = True, s[1:].strip()
-    last_dot = s.rfind("."); last_com = s.rfind(",")
-    if   last_dot == -1 and last_com == -1: num_s = s
-    elif last_dot > last_com:               num_s = s.replace(",", "")
-    else:                                   num_s = s.replace(".", "").replace(",", ".")
+    last_dot, last_com = s.rfind("."), s.rfind(",")
+    if last_dot == -1 and last_com == -1:
+        num_s = s
+    elif last_dot > last_com:                  # 1,234.56 → en_US
+        num_s = s.replace(",", "")
+    else:                                      # 1.234,56 → id_ID
+        num_s = s.replace(".", "").replace(",", ".")
     try:
         num = float(num_s)
     except Exception:
@@ -192,6 +59,7 @@ def _to_num(sr: pd.Series) -> pd.Series:
 
 
 def _to_datetime(val) -> Optional[pd.Timestamp]:
+    """String/datetime + Excel serial (simpan jam)."""
     if pd.isna(val):
         return None
     if isinstance(val, (int, float, np.number)):
@@ -220,68 +88,17 @@ def _to_date(val) -> Optional[pd.Timestamp]:
     return dt.normalize() if dt is not None else None
 
 
-def _read_csv(uploaded_file) -> pd.DataFrame:
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1"):
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(
-                uploaded_file,
-                encoding=enc,
-                sep=None,
-                engine="python",
-                dtype=str,
-                na_filter=False,
-            )
-        except Exception:
-            continue
-    st.error(f"CSV gagal dibaca: {uploaded_file.name}. Simpan ulang sebagai UTF-8.")
-    return pd.DataFrame()
-
-
-def _read_excel_generic(uploaded_file, *, skiprows: int | list[int] | None = None) -> pd.DataFrame:
-    """Baca Excel via openpyxl; tampilkan pesan jelas jika openpyxl tidak ada."""
-    try:
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file, engine="openpyxl", dtype=str, na_filter=False, skiprows=skiprows)
-    except ImportError:
-        st.error(
-            "Gagal membaca Excel: paket **openpyxl** belum terpasang.\n"
-            "Solusi: tambahkan ke `requirements.txt` → `openpyxl>=3.1.0`."
-        )
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Gagal membaca {uploaded_file.name}: {e}")
-        return pd.DataFrame()
-
-
-def _read_tiket_excel(uploaded_file) -> pd.DataFrame:
-    """Prioritas: lewati baris-1 (merge title). Fallback tanpa skiprows jika gagal."""
-    df = _read_excel_generic(uploaded_file, skiprows=1)
-    if not df.empty:
-        return df
-    # Fallback: coba tanpa skip
-    return _read_excel_generic(uploaded_file, skiprows=None)
-
-
-def _read_any(uploaded_file) -> pd.DataFrame:
-    if not uploaded_file:
-        return pd.DataFrame()
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return _read_csv(uploaded_file)
-    return _read_excel_generic(uploaded_file, skiprows=None)
-
-
-def _find_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Cari kolom secara case-insensitive; exact dulu, lalu substring."""
     if df.empty:
         return None
     cols = [c for c in df.columns if isinstance(c, str)]
-    m = {c.lower().strip(): c for c in cols}
-    for n in names:
-        key = n.lower().strip()
-        if key in m:
-            return m[key]
-    for n in names:
+    norm = {c.lower().strip(): c for c in cols}
+    for n in candidates:
+        k = n.lower().strip()
+        if k in norm:
+            return norm[k]
+    for n in candidates:
         key = n.lower().strip()
         for c in cols:
             if key in c.lower():
@@ -297,29 +114,141 @@ def _idr_fmt(n: float) -> str:
     return f"({s})" if neg else s
 
 
-def _concat_tiket_files(files) -> pd.DataFrame:
-    if not files:
+# =========================
+# Fast readers + caching
+# =========================
+
+SUPPORTED_EXTS = (".xlsx", ".xls", ".xlsb", ".csv", ".zip")
+
+@st.cache_data(show_spinner=False)
+def _bytes_of(uploaded_file) -> bytes:
+    """Cache bytes file supaya tidak re-upload ke memori tiap proses."""
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+    return data
+
+
+def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
+    return pd.read_csv(buf, encoding="utf-8-sig", sep=None, engine="python", dtype=str, na_filter=False)
+
+
+def _read_excel_by_ext(buf: io.BytesIO, name: str, *, header=None, skiprows=None) -> pd.DataFrame:
+    low = name.lower()
+    if low.endswith(".xlsb"):
+        # butuh pyxlsb
+        return pd.read_excel(buf, engine="pyxlsb", dtype=str, na_filter=False, header=header)
+    if low.endswith(".xlsx"):
+        return pd.read_excel(buf, engine="openpyxl", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+    if low.endswith(".xls"):
+        # xlrd 1.2.0 masih dukung .xls
+        return pd.read_excel(buf, engine="xlrd", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+    raise ValueError(f"Ekstensi tidak didukung: {name}")
+
+
+def _extract_zip(uploaded_file) -> list[tuple[str, io.BytesIO]]:
+    data = _bytes_of(uploaded_file)
+    out: list[tuple[str, io.BytesIO]] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            nm = info.filename
+            if not nm.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                continue
+            with zf.open(info) as f:
+                out.append((nm, io.BytesIO(f.read())))
+    return out
+
+
+def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
+    scan = min(20, len(df_no_header))
+    best_row, best_score = 0, -1
+    for i in range(scan):
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
+        text = " ".join(row.tolist())
+        score = sum(1 for t in targets if t in text)
+        if score > best_score:
+            best_row, best_score = i, score
+            if score >= 4:
+                break
+    return best_row
+
+
+def _read_tiket_any(uploaded_file) -> pd.DataFrame:
+    """Baca excel/csv/zip untuk Tiket. Auto-skip header merge (tebak baris header)."""
+    name = uploaded_file.name
+    if name.lower().endswith(".zip"):
+        frames = []
+        for nm, buf in _extract_zip(uploaded_file):
+            frames.append(_read_tiket_from_bytes(buf, nm))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        buf = io.BytesIO(_bytes_of(uploaded_file))
+        return _read_tiket_from_bytes(buf, name)
+
+
+def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".csv"):
+        df = _read_csv_fast(buf)
+        df["__source__"] = name
+        return df
+    # 1) baca tanpa header, deteksi baris header
+    raw = _read_excel_by_ext(buf, name, header=None)
+    if raw.empty:
         return pd.DataFrame()
+    targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
+    header_row = _guess_header_row(raw, targets)
+    # 2) baca ulang dengan header=header_row
+    buf.seek(0)
+    df = _read_excel_by_ext(buf, name, header=header_row)
+    df["__source__"] = name
+    return df
+
+
+def _read_settle_any(uploaded_file) -> pd.DataFrame:
+    """Baca settlement (csv/xlsx/xls/xlsb/zip)."""
+    name = uploaded_file.name
+    if name.lower().endswith(".zip"):
+        frames = []
+        for nm, buf in _extract_zip(uploaded_file):
+            frames.append(_read_settle_from_bytes(buf, nm))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        buf = io.BytesIO(_bytes_of(uploaded_file))
+        return _read_settle_from_bytes(buf, name)
+
+
+def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".csv"):
+        df = _read_csv_fast(buf)
+    else:
+        df = _read_excel_by_ext(buf, name, header=0)
+    df["__source__"] = name
+    return df
+
+
+def _concat_tiket_files(files) -> pd.DataFrame:
     frames = []
-    for f in files:
-        df = _read_tiket_excel(f)
+    for f in (files or []):
+        df = _read_tiket_any(f)
         if not df.empty:
-            df["__source__"] = f.name
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _concat_settle_files(files) -> pd.DataFrame:
-    if not files:
-        return pd.DataFrame()
     frames = []
-    for f in files:
-        df = _read_any(f)
+    for f in (files or []):
+        df = _read_settle_any(f)
         if not df.empty:
-            df["__source__"] = f.name
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
+
+# =========================
+# Business helpers
+# =========================
 
 def _month_selector() -> Tuple[int, int]:
     from datetime import date
@@ -348,7 +277,7 @@ def _norm_label(s: str) -> str:
 
 
 def _derive_action_date_from_created(created_sr: pd.Series, zone: str) -> pd.Series:
-    """Ambil tanggal dari 'Created'; jika jam==0 → mundur sesuai zona: WIB=0, WITA=−1, WIT=−2."""
+    """Ambil tanggal dari 'Created'; jika jam==0 → mundur WIB=0/WITA=1/WIT=2 hari (kenapa: selisih zona)."""
     zone = zone.upper()
     minus_days = 0
     if "WITA" in zone:
@@ -362,8 +291,7 @@ def _derive_action_date_from_created(created_sr: pd.Series, zone: str) -> pd.Ser
         s = str(val).strip()
         if not s:
             return None
-
-        # Fixed width "YYYY-MM-DD HH:MM:SS"
+        # coba fixed-width "YYYY-MM-DD HH:MM:SS"
         date_part, hour = None, None
         if len(s) >= 19 and s[10] == " " and s[13] == ":" and s[16] == ":":
             date_part = s[:10]
@@ -371,7 +299,6 @@ def _derive_action_date_from_created(created_sr: pd.Series, zone: str) -> pd.Ser
                 hour = int(s[11:13])
             except Exception:
                 hour = None
-
         if date_part is None or hour is None:
             dt = _to_datetime(s)
             if dt is None:
@@ -386,7 +313,6 @@ def _derive_action_date_from_created(created_sr: pd.Series, zone: str) -> pd.Ser
                     return None
                 base_date = pd.Timestamp(dt.date())
                 hour = int(dt.hour)
-
         if hour == 0 and minus_days > 0:
             base_date = base_date - pd.Timedelta(days=minus_days)
         return base_date
@@ -394,44 +320,63 @@ def _derive_action_date_from_created(created_sr: pd.Series, zone: str) -> pd.Ser
     return created_sr.apply(conv)
 
 
-# ---------------- App ----------------
+# =========================
+# App
+# =========================
 
 st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement", layout="wide")
 st.title("Rekonsiliasi: Tiket Detail vs Settlement Dana")
 
 with st.sidebar:
     st.header("1) Upload Sumber (multi-file)")
-    tiket_files = st.file_uploader("Tiket Detail (Excel .xls/.xlsx)", type=["xls", "xlsx"], accept_multiple_files=True)
-    settle_files = st.file_uploader("Settlement Dana (CSV/Excel)", type=["csv", "xls", "xlsx"], accept_multiple_files=True)
+    tiket_files = st.file_uploader(
+        "Tiket Detail (.csv/.xls/.xlsx/.xlsb/.zip)",
+        type=["csv", "xls", "xlsx", "xlsb", "zip"],
+        accept_multiple_files=True,
+    )
+    settle_files = st.file_uploader(
+        "Settlement Dana (.csv/.xls/.xlsx/.xlsb/.zip)",
+        type=["csv", "xls", "xlsx", "xlsb", "zip"],
+        accept_multiple_files=True,
+    )
 
     st.header("2) Parameter Bulan & Tahun (WAJIB)")
     y, m = _month_selector()
     month_start = pd.Timestamp(y, m, 1)
     month_end = pd.Timestamp(y, m, calendar.monthrange(y, m)[1])
-    st.caption(f"Periode dipakai: {month_start.date()} s/d {month_end.date()}")
+    st.caption(f"Periode: {month_start.date()} s/d {month_end.date()}")
 
     st.header("3) Zona Waktu Cabang")
     zone = st.selectbox("Zona waktu", ["WIB (UTC+7)", "WITA (UTC+8)", "WIT (UTC+9)"], index=0)
 
     go = st.button("Proses", type="primary", use_container_width=True)
 
+# gabung file
 tiket_df = _concat_tiket_files(tiket_files)
 settle_df = _concat_settle_files(settle_files)
 
 if go:
-    # -------- Tiket Detail (pakai 'Created') --------
-    t_created = _find_col(tiket_df, ["Created"])
-    t_amt     = _find_col(tiket_df, ["tarif"])
-    t_stat    = _find_col(tiket_df, ["St Bayar", "Status Bayar", "status"])
-    t_bank    = _find_col(tiket_df, ["Bank", "Payment Channel", "channel"])
+    if not tiket_files:
+        st.error("Harap upload **Tiket Detail** minimal 1 file.")
+        st.stop()
+
+    # -------- Tiket (pakai 'Created') --------
+    t_created = _find_col(tiket_df, [
+        "Created", "Created Date", "Create Date", "Tanggal Buat", "Created (WIB)", "Created Time"
+    ])
+    t_amt  = _find_col(tiket_df, ["tarif", "nominal", "amount", "total", "harga"])
+    t_stat = _find_col(tiket_df, ["St Bayar", "Status Bayar", "status bayar", "status"])
+    t_bank = _find_col(tiket_df, ["Bank", "Payment Channel", "channel", "payment method", "bank/ewallet"])
 
     missing = []
     if t_created is None: missing.append("Tiket Detail: Created")
-    if t_amt is None:     missing.append("Tiket Detail: tarif")
-    if t_stat is None:    missing.append("Tiket Detail: St Bayar")
-    if t_bank is None:    missing.append("Tiket Detail: Bank")
+    if t_amt is None:     missing.append("Tiket Detail: tarif/nominal")
+    if t_stat is None:    missing.append("Tiket Detail: St Bayar/Status")
+    if t_bank is None:    missing.append("Tiket Detail: Bank/Channel")
     if missing:
-        st.error("Kolom wajib tidak ditemukan → " + "; ".join(missing)); st.stop()
+        st.error("Kolom wajib tidak ditemukan → " + "; ".join(missing))
+        st.write("Kolom Tiket tersedia:", list(tiket_df.columns))
+        st.stop()
 
     td = tiket_df.copy()
     td["__action_date"] = _derive_action_date_from_created(td[t_created], zone)
@@ -446,18 +391,21 @@ if go:
     tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    # -------- Settlement Dana --------
-    s_txn_date    = _find_col(settle_df, ["Transaction Date"])
-    s_settle_date = _find_col(settle_df, ["Settlement Date", "SettlementDate"])
-    s_amt         = _find_col(settle_df, ["Settlement Amount"])
-    s_prod        = _find_col(settle_df, ["Product Name", "Product"])
+    # -------- Settlement --------
+    s_txn_date    = _find_col(settle_df, ["Transaction Date", "Trans Date", "Tanggal Transaksi"])
+    s_settle_date = _find_col(settle_df, ["Settlement Date", "SettlementDate", "Tanggal Settlement"])
+    s_amt         = _find_col(settle_df, ["Settlement Amount", "Amount Settlement", "Nominal Settlement", "Amount"])
+    s_prod        = _find_col(settle_df, ["Product Name", "Product", "ProductName", "Nama Produk"])
 
     miss2 = []
-    if s_txn_date is None:    miss2.append("Settlement: Transaction Date")
-    if s_amt is None:         miss2.append("Settlement: Settlement Amount")
-    if miss2: st.error("Kolom wajib tidak ditemukan → " + "; ".join(miss2)); st.stop()
+    if s_txn_date is None: miss2.append("Settlement: Transaction Date")
+    if s_amt is None:      miss2.append("Settlement: Settlement Amount")
+    if miss2:
+        st.error("Kolom wajib tidak ditemukan → " + "; ".join(miss2))
+        st.write("Kolom Settlement tersedia:", list(settle_df.columns))
+        st.stop()
 
-    # Total ESPAY (Transaction Date)
+    # Total ESPAY → Transaction Date
     sd_txn = settle_df.copy()
     sd_txn[s_txn_date] = sd_txn[s_txn_date].apply(_to_date)
     sd_txn = sd_txn[~sd_txn[s_txn_date].isna()]
@@ -466,12 +414,8 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA (Settlement Date + Product Name)
-    if s_settle_date is None or s_prod is None:
-        settle_bca = pd.Series(dtype=float)
-        settle_nonbca = pd.Series(dtype=float)
-        st.warning("Kolom 'Settlement Date' atau 'Product Name' tidak ditemukan. BCA/Non-BCA = 0.")
-    else:
+    # BCA/Non-BCA → Settlement Date + Product Name == "BCA VA Online"
+    if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
         sd_settle[s_settle_date] = sd_settle[s_settle_date].apply(_to_date)
         sd_settle = sd_settle[~sd_settle[s_settle_date].isna()]
@@ -484,13 +428,19 @@ if go:
 
         settle_bca    = sd_settle[bca_mask].groupby(sd_settle[bca_mask][s_settle_date])[s_amt].sum() if bca_mask.any() else pd.Series(dtype=float)
         settle_nonbca = sd_settle[~bca_mask].groupby(sd_settle[~bca_mask][s_settle_date])[s_amt].sum() if (~bca_mask).any() else pd.Series(dtype=float)
+    else:
+        st.warning("Kolom 'Settlement Date' atau 'Product Name' tidak ditemukan. Kolom BCA/Non-BCA diisi 0.")
+        settle_bca = pd.Series(dtype=float)
+        settle_nonbca = pd.Series(dtype=float)
 
-    # -------- Reindex ke 1..akhir bulan --------
+    # -------- Range tanggal 1..akhir bulan --------
     idx = pd.Index(pd.date_range(month_start, month_end, freq="D").date, name="Tanggal")
 
     def _reidx(s: pd.Series) -> pd.Series:
-        if not isinstance(s, pd.Series): s = pd.Series(dtype=float)
-        if len(getattr(s, "index", [])): s.index = pd.to_datetime(s.index).date
+        if not isinstance(s, pd.Series):
+            s = pd.Series(dtype=float)
+        if len(getattr(s, "index", [])):
+            s.index = pd.to_datetime(s.index).date
         return s.reindex(idx, fill_value=0.0)
 
     tiket_series  = _reidx(tiket_by_date)
@@ -526,6 +476,7 @@ if go:
     st.subheader("Hasil Rekonsiliasi per Tanggal (mengikuti bulan parameter)")
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
+    # -------- Unduh Excel --------
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         view_total.to_excel(xw, index=False, sheet_name="Rekonsiliasi")
