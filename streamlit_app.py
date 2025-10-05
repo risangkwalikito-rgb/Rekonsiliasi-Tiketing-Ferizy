@@ -1,8 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-"""Rekonsiliasi: Tiket Detail vs Settlement Dana (fuzzy bank + grafik + diagnosa + toggle koreksi jam 00)
-   Versi cepat: CSV C-engine, Excel peek 25 baris + usecols, parser vektorisasi, cache parsing per file.
-"""
+"""Rekonsiliasi: Tiket Detail vs Settlement Dana (versi cepat + robust header guessing)"""
 
 from __future__ import annotations
 
@@ -53,28 +51,17 @@ def _parse_money(val) -> float:
 
 
 def _to_num(sr: pd.Series) -> pd.Series:
-    """Vektorisasi parsing uang."""
     if sr.empty:
         return sr.astype(float)
     s = sr.astype(str).str.strip().str.lower()
-
-    # (123) atau 123- -> -123
     s = s.str.replace(r"\(([^)]*)\)", r"-\1", regex=True)
     s = s.str.replace(r"\-$", "", regex=True)
-
-    # buang label/teks & karakter non-digit dasar
     s = s.str.replace(r"(idr|rp|cr|dr)", "", regex=True)
     s = s.str.replace(r"[^0-9,\.\-]", "", regex=True)
-
-    # jika ada titik & koma sekaligus: anggap koma = thousands, hapus koma
     both = s.str.contains(",") & s.str.contains("\.")
     s = s.where(~both, s.str.replace(",", "", regex=False))
-
-    # jika hanya koma sebagai decimal, jadikan titik
     only_comma = s.str.contains(",") & ~s.str.contains("\.")
     s = s.where(~only_comma, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-
-    # hilangkan sisa thousands separator koma, lalu ke numeric
     out = pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
     return out.astype(float)
 
@@ -104,7 +91,6 @@ def _to_datetime(val) -> Optional[pd.Timestamp]:
 
 
 def _to_datetime_series(sr: pd.Series) -> pd.Series:
-    """Vektorisasi parsing datetime + dukung Excel serial number."""
     if sr.empty:
         return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
     dt = pd.to_datetime(sr, errors="coerce", dayfirst=True, infer_datetime_format=True)
@@ -112,8 +98,6 @@ def _to_datetime_series(sr: pd.Series) -> pd.Series:
     if mask_na.any():
         dt2 = pd.to_datetime(sr[mask_na], errors="coerce", dayfirst=False, infer_datetime_format=True)
         dt = dt.where(~mask_na, dt2)
-
-    # Excel serial
     num = pd.to_numeric(sr, errors="coerce")
     mask_serial = num.between(1, 100000)
     if mask_serial.any():
@@ -166,20 +150,16 @@ def _bytes_of(uploaded_file) -> bytes:
 
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
-    """C-engine secepat mungkin, fallback bila perlu."""
-    # 1) default: C-engine (delimiter koma)
     try:
         buf.seek(0)
         return pd.read_csv(buf, dtype=str, na_filter=False)
     except Exception:
         pass
-    # 2) coba delimiter ';' (tetap C-engine)
     try:
         buf.seek(0)
         return pd.read_csv(buf, sep=";", dtype=str, na_filter=False)
     except Exception:
         pass
-    # 3) terakhir: sniffing engine="python"
     buf.seek(0)
     return pd.read_csv(buf, engine="python", sep=None, dtype=str, na_filter=False)
 
@@ -211,10 +191,10 @@ def _extract_zip_bytes(data: bytes) -> list[tuple[str, io.BytesIO]]:
 
 
 def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
-    scan = min(20, len(df_no_header))
+    scan = min(25, len(df_no_header))
     best_row, best_score = 0, -1
     for i in range(scan):
-        row = df_no_header.iloc[i].astype(str).str.lower().str.strip()
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
         text = " ".join(row.tolist())
         score = sum(1 for t in targets if t in text)
         if score > best_score:
@@ -224,6 +204,8 @@ def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int
     return best_row
 
 
+# ---------- TIKET readers ----------
+
 def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     low = name.lower()
     if low.endswith(".csv"):
@@ -231,7 +213,6 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
         df["__source__"] = name
         return df
 
-    # Peek kecil untuk tebak header (hemat waktu)
     peek_targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
     buf.seek(0)
     peek = _read_excel_by_ext(buf, name, header=None, nrows=25)
@@ -239,7 +220,6 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
         return pd.DataFrame()
     header_row = _guess_header_row(peek, peek_targets)
 
-    # Baca penuh tapi hanya kolom yang (kemungkinan) dipakai
     need_keys = [
         "created", "create date", "created date", "created (wib)", "created time", "tanggal",
         "tarif", "nominal", "amount", "total", "harga",
@@ -250,21 +230,55 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
 
     buf.seek(0)
     df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
+    if len(df.columns) == 0:  # fallback jika terlalu agresif
+        buf.seek(0)
+        df = _read_excel_by_ext(buf, name, header=header_row)
     df["__source__"] = name
     return df
 
 
+# ---------- SETTLEMENT readers (diperbaiki) ----------
+
+SETTLE_TARGETS = [
+    "transaction date", "trans date", "tanggal transaksi", "tgl transaksi", "tanggal trans", "tgl trans",
+    "settlement date", "settlementdate", "tanggal settlement", "tgl settlement",
+    "settlement amount", "amount settlement", "nominal settlement",
+    "amount", "nominal", "jumlah", "total amount", "net settlement amount", "net settlement",
+    "product name", "product", "productname", "nama produk"
+]
+
 def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     low = name.lower()
+
+    # --- CSV: coba biasa, lalu fallback tebak header ---
     if low.endswith(".csv"):
         df = _read_csv_fast(buf)
-    else:
-        usecols_fn = lambda c: any(k in str(c).lower() for k in
-                                   ["transaction date", "trans date", "tanggal transaksi",
-                                    "settlement date", "settlementdate", "tanggal settlement",
-                                    "settlement amount", "amount settlement", "nominal settlement", "amount",
-                                    "product name", "product", "productname", "nama produk"])
-        df = _read_excel_by_ext(buf, name, header=0, usecols=usecols_fn)
+        if len(df.columns) == 0:
+            # fallback peek tanpa header untuk tebak baris header
+            try:
+                buf.seek(0)
+                peek = pd.read_csv(buf, engine="python", sep=None, header=None, nrows=25, dtype=str, na_filter=False)
+                header_row = _guess_header_row(peek, SETTLE_TARGETS)
+                buf.seek(0)
+                df = pd.read_csv(buf, engine="python", sep=None, header=header_row, dtype=str, na_filter=False)
+            except Exception:
+                df = pd.DataFrame()
+        df["__source__"] = name
+        return df
+
+    # --- EXCEL: peek 25 baris → tebak header ---
+    buf.seek(0)
+    peek = _read_excel_by_ext(buf, name, header=None, nrows=25)
+    if peek.empty:
+        return pd.DataFrame()
+    header_row = _guess_header_row(peek, SETTLE_TARGETS)
+
+    usecols_fn = lambda c: any(k in str(c).lower() for k in SETTLE_TARGETS)
+    buf.seek(0)
+    df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
+    if len(df.columns) == 0:   # fallback jika usecols terlalu ketat
+        buf.seek(0)
+        df = _read_excel_by_ext(buf, name, header=header_row)
     df["__source__"] = name
     return df
 
@@ -340,12 +354,10 @@ def _derive_action_date_from_created(created_sr: pd.Series, zone: str, *, adjust
     base = dt.dt.normalize()
     if not adjust_midnight:
         return base
-
     z = zone.upper()
     minus_days = 1 if "WITA" in z else (2 if "WIT" in z else 0)
     if minus_days == 0:
         return base
-
     mask_midnight = dt.dt.hour.eq(0)
     shift = pd.to_timedelta(mask_midnight.astype(int) * minus_days, unit="D")
     return (base - shift)
@@ -394,7 +406,7 @@ if go:
         st.error("Harap upload **Tiket Detail** minimal 1 file.")
         st.stop()
 
-    # -------- Tiket (pakai Created) --------
+    # -------- Tiket --------
     t_created = _find_col(tiket_df, ["Created", "Created Date", "Create Date", "Tanggal Buat", "Created (WIB)", "Created Time"])
     t_amt  = _find_col(tiket_df, ["tarif", "nominal", "amount", "total", "harga"])
     t_stat = _find_col(tiket_df, ["St Bayar", "Status Bayar", "status bayar", "status"])
@@ -414,7 +426,6 @@ if go:
     td["__action_date"] = _derive_action_date_from_created(td[t_created], zone, adjust_midnight=adjust_midnight)
     td = td[~td["__action_date"].isna()]
 
-    # === Diagnosa (membantu cek tgl 1–7 kosong) ===
     with st.expander("🔎 Diagnosa data Tiket (klik untuk lihat)"):
         try:
             td["_raw_dt"] = _to_datetime_series(td[t_created])
@@ -458,7 +469,7 @@ if go:
             "Status ≠ paid": drop_status,
             "Bank ≠ espay (exact check)": drop_bank_exact,
             "Keluar bulan parameter (setelah koreksi)": out_month_rows,
-            "Fuzzy Bank aktif?": True,  # hanya info
+            "Fuzzy Bank aktif?": fuzzy_bank,
         })
 
         first7 = pd.date_range(month_start, month_start + pd.Timedelta(days=6), freq="D").date
@@ -473,7 +484,7 @@ if go:
         st.markdown("**Distribusi nilai `Bank` untuk tanggal 1–7 (setelah koreksi)**")
         st.dataframe(bank_1_7, use_container_width=True)
 
-    # Filter paid + espay (exact / fuzzy) + bulan parameter
+    # Filter paid + espay + bulan
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
     td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
     bank_mask = td_bank_v.str.contains("espay") if fuzzy_bank else td_bank_v.eq("espay")
@@ -485,10 +496,17 @@ if go:
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
     # -------- Settlement --------
-    s_txn_date    = _find_col(settle_df, ["Transaction Date", "Trans Date", "Tanggal Transaksi"])
-    s_settle_date = _find_col(settle_df, ["Settlement Date", "SettlementDate", "Tanggal Settlement"])
-    s_amt         = _find_col(settle_df, ["Settlement Amount", "Amount Settlement", "Nominal Settlement", "Amount"])
-    s_prod        = _find_col(settle_df, ["Product Name", "Product", "ProductName", "Nama Produk"])
+    s_txn_date = _find_col(settle_df, [
+        "Transaction Date", "Trans Date", "Tanggal Transaksi", "Tgl Transaksi", "Tanggal Trans", "Tgl Trans"
+    ])
+    s_settle_date = _find_col(settle_df, [
+        "Settlement Date", "SettlementDate", "Tanggal Settlement", "Tgl Settlement"
+    ])
+    s_amt = _find_col(settle_df, [
+        "Settlement Amount", "Amount Settlement", "Nominal Settlement",
+        "Amount", "Nominal", "Jumlah", "Total Amount", "Net Settlement Amount", "Net Settlement"
+    ])
+    s_prod = _find_col(settle_df, ["Product Name", "Product", "ProductName", "Nama Produk"])
 
     miss2 = []
     if s_txn_date is None: miss2.append("Settlement: Transaction Date")
@@ -569,15 +587,13 @@ if go:
     st.subheader("Hasil Rekonsiliasi per Tanggal (mengikuti bulan parameter)")
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
-    # -------- Grafik ringkas (opsional) --------
     if show_charts:
         st.subheader("Grafik Ringkas")
         chart_data = view[view["Tanggal"] != "TOTAL"].set_index("Tanggal")[
             ["Tiket Detail ESPAY", "Settlement Dana ESPAY", "Settlement Dana BCA", "Settlement Dana Non BCA"]
         ]
-        st.bar_chart(chart_data)  # tanpa set warna
+        st.bar_chart(chart_data)
 
-    # -------- Unduh Excel --------
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         view_total.to_excel(xw, index=False, sheet_name="Rekonsiliasi")
