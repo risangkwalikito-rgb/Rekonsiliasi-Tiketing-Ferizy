@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """Rekonsiliasi: Tiket Detail vs Settlement Dana
    - Settlement Dana ESPAY = sum(Settlement Amount/Ammount) per Transaction Date (tanpa filter bank)
-   - Cepat: CSV C-engine, Excel peek 25 baris + usecols, vektorisasi parsing, cache per file
-   - Robust: Tebak header (Tiket & Settlement), sinonim kolom ID/EN
+   - Parser uang robust (mendukung 1.095.568.800, 1.095.568.800,00, 1,095,568,800.00, (123), 123-)
+   - Cepat: CSV C-engine, Excel peek 25 baris + usecols, cache per file
+   - Tebak header otomatis untuk Tiket & Settlement
 """
 
 from __future__ import annotations
@@ -23,37 +24,87 @@ from dateutil import parser as dtparser
 # ========== Parsers & helpers ==========
 
 def _to_num(sr: pd.Series) -> pd.Series:
-    """Parser uang robust: titik ribuan, koma desimal, campuran, (123) dan 123-."""
+    """Parser uang yang kuat untuk berbagai format ID/EN."""
     if sr.empty:
         return sr.astype(float)
 
-    s = sr.astype(str).str.strip().str.lower()
+    def parse_one(x: str) -> float:
+        if x is None:
+            return 0.0
+        s = str(x).strip().lower()
+        if s in ("", "nan", "none"):
+            return 0.0
 
-    # Negatif: (123) -> -123, dan 123- -> -123
-    s = s.str.replace(r"\(([^)]*)\)", r"-\1", regex=True)
-    s = s.str.replace(r"^(.+)\-$", r"-\1", regex=True)
+        # negatif: (123) atau 123-
+        neg = False
+        if s.startswith("(") and s.endswith(")"):
+            neg, s = True, s[1:-1].strip()
+        if s.endswith("-"):
+            neg, s = True, s[:-1].strip()
 
-    # Buang label & karakter non angka
-    s = s.str.replace(r"(idr|rp|cr|dr)", "", regex=True)
-    s = s.str.replace(r"[^0-9,\.\-]", "", regex=True)
+        # buang label & karakter selain digit/tanda pemisah
+        s = re.sub(r"(idr|rp|cr|dr)", "", s)
+        s = re.sub(r"[^0-9\.,\-]", "", s)
 
-    has_comma = s.str.contains(",")
-    has_dot   = s.str.contains(r"\.")
+        if s == "" or s in ("-",):
+            return 0.0
 
-    # Ada koma & titik -> anggap koma = thousands, titik = desimal
-    both = has_comma & has_dot
-    s = s.where(~both, s.str.replace(",", "", regex=False))
+        # Posisi separator
+        last_dot = s.rfind(".")
+        last_com = s.rfind(",")
 
-    # Hanya koma -> koma = desimal; titik (jika ada) = thousands
-    only_comma = has_comma & ~has_dot
-    s = s.where(~only_comma, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+        if last_dot == -1 and last_com == -1:
+            num = float(s)
+            return -num if neg else num
 
-    # Hanya titik -> biasanya thousands (IDR); drop semua titik
-    only_dot = has_dot & ~has_comma
-    s = s.where(~only_dot, s.str.replace(".", "", regex=False))
+        if last_dot != -1 and last_com != -1:
+            # Ada keduanya -> gunakan yang paling kanan sebagai desimal
+            if last_dot > last_com:
+                # '.' desimal; hapus semua koma (thousands)
+                s2 = s.replace(",", "")
+                s2 = s2.replace(".", ".")  # no-op, agar konsisten
+            else:
+                # ',' desimal; hapus semua titik (thousands), koma -> '.'
+                s2 = s.replace(".", "")
+                s2 = s2.replace(",", ".")
+            try:
+                num = float(s2)
+            except Exception:
+                num = 0.0
+            return -num if neg else num
 
-    out = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    return out.astype(float)
+        # Hanya satu jenis separator
+        sep = "." if last_dot != -1 else ","
+        cnt = s.count(sep)
+        # Jika muncul lebih dari sekali -> hampir pasti thousands -> buang semua
+        if cnt > 1:
+            s2 = s.replace(sep, "")
+            try:
+                num = float(s2)
+            except Exception:
+                num = 0.0
+            return -num if neg else num
+
+        # Hanya 1 separator -> tentukan desimal/thousands dari panjang ekor
+        frac_len = len(s) - (s.rfind(sep) + 1)
+        if 1 <= frac_len <= 2:
+            # anggap desimal
+            s2 = s.replace(sep, ".")
+            try:
+                num = float(s2)
+            except Exception:
+                num = 0.0
+            return -num if neg else num
+        else:
+            # anggap thousands
+            s2 = s.replace(sep, "")
+            try:
+                num = float(s2)
+            except Exception:
+                num = 0.0
+            return -num if neg else num
+
+    return sr.apply(parse_one).astype(float)
 
 
 def _to_datetime(val) -> Optional[pd.Timestamp]:
@@ -144,7 +195,6 @@ def _bytes_of(uploaded_file) -> bytes:
 
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
-    """C-engine dulu; fallback sniffing engine=python."""
     try:
         buf.seek(0);  return pd.read_csv(buf, dtype=str, na_filter=False)
     except Exception:
@@ -222,7 +272,7 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
 
     buf.seek(0)
     df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
-    if len(df.columns) == 0:  # fallback jika terlalu ketat
+    if len(df.columns) == 0:
         buf.seek(0)
         df = _read_excel_by_ext(buf, name, header=header_row)
     df["__source__"] = name
@@ -362,7 +412,7 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-# gabung file dengan cache per file
+# gabung file (cache per file)
 tiket_df = _concat_tiket_files(tiket_files)
 settle_df = _concat_settle_files(settle_files)
 
@@ -378,7 +428,6 @@ with st.sidebar:
     adjust_midnight = st.checkbox("Koreksi jam 00 (WITA −1 hari, WIT −2 hari)", value=False)
 
     st.header("4) Opsi")
-    fuzzy_bank = st.checkbox("Pencocokan Bank mengandung 'espay' (bukan exact)", value=True)
     show_charts = st.checkbox("Tampilkan grafik ringkas", value=True)
 
     go = st.button("Proses", type="primary", use_container_width=True)
@@ -408,10 +457,10 @@ if go:
     td["__action_date"] = _derive_action_date_from_created(td[t_created], zone, adjust_midnight=adjust_midnight)
     td = td[~td["__action_date"].isna()]
 
-    # Filter paid + espay + bulan
+    # filter paid + espay + bulan
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
     td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
-    bank_mask_tiket = td_bank_v.str.contains("espay") if fuzzy_bank else td_bank_v.eq("espay")
+    bank_mask_tiket = td_bank_v.str.contains("espay")
     td = td[td_stat_v.eq("paid") & bank_mask_tiket]
     td = td[(td["__action_date"] >= month_start) & (td["__action_date"] <= month_end)]
     td[t_amt] = _to_num(td[t_amt])
@@ -448,7 +497,7 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA (opsional: tidak mempengaruhi "Settlement Dana ESPAY")
+    # BCA/Non-BCA (opsional, tidak mempengaruhi kolom utama)
     if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
         sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
@@ -466,7 +515,7 @@ if go:
         settle_bca = pd.Series(dtype=float)
         settle_nonbca = pd.Series(dtype=float)
 
-    # -------- Reindex ke 1..akhir bulan --------
+    # -------- Reindex 1..akhir bulan --------
     idx = pd.Index(pd.date_range(month_start, month_end, freq="D").date, name="Tanggal")
 
     def _reidx(s: pd.Series) -> pd.Series:
