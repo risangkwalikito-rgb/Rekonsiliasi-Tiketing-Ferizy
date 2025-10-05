@@ -1,22 +1,22 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
 """Rekonsiliasi: Tiket Detail vs Settlement Dana
+   - Tiket: auto pilih tanggal Paid/Payment (fallback Created), koreksi jam 00 per-baris (label WITA/WIT) dengan fallback dari zona sidebar
    - Settlement Dana ESPAY = sum(Settlement Amount/Ammount) per Transaction Date (tanpa filter bank)
-   - Tiket: pilih kolom tanggal (default Created) + filter status longgar (paid/success/settle/lunas/berhasil)
-   - Parser uang robust (1.095.568.800, 1,095,568,800.00, (123), 123-)
+   - Parser uang & tanggal robust (format ID/EN, 1.095.568.800, (123), 123-, WIB/WITA/WIT)
    - Baca cepat: CSV C-engine, Excel peek 25 baris + usecols, cache per file
 """
 
 from __future__ import annotations
-
 import io, re, zipfile, calendar
 from typing import Optional, List, Tuple, Iterable
 import numpy as np, pandas as pd, streamlit as st
 from dateutil import parser as dtparser
 
-# ========= Parsers & helpers =========
+# ========= Parsers =========
 
 def _to_num(sr: pd.Series) -> pd.Series:
+    """Parser uang robust untuk berbagai format Indonesia/Inggris."""
     if sr.empty: return sr.astype(float)
     def parse_one(x: str) -> float:
         if x is None: return 0.0
@@ -28,53 +28,43 @@ def _to_num(sr: pd.Series) -> pd.Series:
         s = re.sub(r"(idr|rp|cr|dr)", "", s)
         s = re.sub(r"[^0-9\.,\-]", "", s)
         if not s or s == "-": return 0.0
-        last_dot, last_com = s.rfind("."), s.rfind(",")
-        if last_dot == -1 and last_com == -1:
+        d, c = s.rfind("."), s.rfind(",")
+        if d == -1 and c == -1:
             num = float(s)
-        elif last_dot != -1 and last_com != -1:
-            if last_dot > last_com:  # '.' decimal
-                num = float(s.replace(",", ""))
-            else:                    # ',' decimal
-                num = float(s.replace(".", "").replace(",", "."))
+        elif d != -1 and c != -1:
+            num = float(s.replace(",", "")) if d > c else float(s.replace(".", "").replace(",", "."))
         else:
-            sep = "." if last_dot != -1 else ","
+            sep = "." if d != -1 else ","
             if s.count(sep) > 1:
-                num = float(s.replace(sep, ""))            # thousands
+                num = float(s.replace(sep, ""))                 # thousands
             else:
                 frac_len = len(s) - (s.rfind(sep) + 1)
-                if 1 <= frac_len <= 2: num = float(s.replace(sep, "."))  # decimal
-                else: num = float(s.replace(sep, ""))                    # thousands
+                num = float(s.replace(sep, ".")) if 1 <= frac_len <= 2 else float(s.replace(sep, ""))
         return -num if neg else num
     return sr.apply(parse_one).astype(float)
 
-def _to_datetime(val) -> Optional[pd.Timestamp]:
-    if pd.isna(val): return None
-    if isinstance(val, (int, float, np.number)):
-        if np.isfinite(val) and 1 <= float(val) <= 100000:
-            base = pd.Timestamp("1899-12-30")
-            try: return base + pd.to_timedelta(float(val), unit="D")
-            except Exception: return None
-        return None
-    if isinstance(val, (pd.Timestamp, np.datetime64)): return pd.to_datetime(val)
-    s = str(val).strip()
-    if not s: return None
-    for dayfirst in (True, False):
-        try: return pd.Timestamp(dtparser.parse(s, dayfirst=dayfirst, fuzzy=True))
-        except Exception: continue
-    return None
+# label zona waktu
+_TZ_PAT = re.compile(r"(?i)\b(wib|wita|wit|utc\+?7|utc\+?8|utc\+?9)\b")
+
+def _clean_dt_series(sr: pd.Series) -> pd.Series:
+    return sr.astype(str).str.replace(_TZ_PAT, "", regex=True).str.replace("T", " ", regex=False).str.strip()
 
 def _to_datetime_series(sr: pd.Series) -> pd.Series:
+    """Parser tanggal vektorisasi + fallback dateutil + Excel serial."""
     if sr.empty: return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
-    dt = pd.to_datetime(sr, errors="coerce", dayfirst=True, infer_datetime_format=True)
+    s_clean = _clean_dt_series(sr)
+    dt = pd.to_datetime(s_clean, errors="coerce", dayfirst=True, infer_datetime_format=True)
     mask = dt.isna()
     if mask.any():
-        dt2 = pd.to_datetime(sr[mask], errors="coerce", dayfirst=False, infer_datetime_format=True)
-        dt = dt.where(~mask, dt2)
+        dt_fallback = s_clean[mask].apply(lambda x: pd.Timestamp(dtparser.parse(x, dayfirst=True, fuzzy=True)) if str(x).strip() else pd.NaT)
+        dt = dt.where(~mask, dt_fallback)
+    # Excel serial number
     num = pd.to_numeric(sr, errors="coerce")
     mask_serial = num.between(1, 100000)
     if mask_serial.any():
         base = pd.Timestamp("1899-12-30")
-        dt = dt.where(~mask_serial, base + pd.to_timedelta(num[mask_serial], unit="D"))
+        dt_serial = base + pd.to_timedelta(num[mask_serial], unit="D")
+        dt = dt.where(~mask_serial, dt_serial)
     return dt
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -101,14 +91,12 @@ def _norm_label(s: str) -> str:
 
 # ========= Readers (cache, zip, header guess) =========
 
-SUPPORTED_EXTS = (".xlsx", ".xls", ".xlsb", ".csv", ".zip")
-
 @st.cache_data(show_spinner=False)
 def _bytes_of(uploaded_file) -> bytes:
     uploaded_file.seek(0); data = uploaded_file.read(); uploaded_file.seek(0); return data
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
-    try: buf.seek(0); return pd.read_csv(buf, dtype=str, na_filter=False)
+    try: buf.seek(0); return pd.read_csv(buf, dtype=str, na_filter=False)      # C-engine
     except Exception: ...
     try: buf.seek(0); return pd.read_csv(buf, sep=";", dtype=str, na_filter=False)
     except Exception: ...
@@ -127,7 +115,7 @@ def _extract_zip_bytes(data: bytes) -> list[tuple[str, io.BytesIO]]:
         for info in zf.infolist():
             if info.is_dir(): continue
             nm = info.filename
-            if nm.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+            if nm.lower().endswith((".xlsx",".xls",".xlsb",".csv")):
                 with zf.open(info) as f: out.append((nm, io.BytesIO(f.read())))
     return out
 
@@ -145,19 +133,19 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     low = name.lower()
     if low.endswith(".csv"):
         df = _read_csv_fast(buf); df["__source__"] = name; return df
-    peek_targets = ["created","tarif","st bayar","status","bank","channel","payment","bayar"]
+    peek_targets = ["created","paid","payment","bayar","tarif","status","bank","channel"]
     buf.seek(0); peek = _read_excel_by_ext(buf, name, header=None, nrows=25)
     if peek.empty: return pd.DataFrame()
     header_row = _guess_header_row(peek, peek_targets)
-    need_keys = ["created","create date","created date","created (wib)","created time","tanggal",
-                 "paid","payment","bayar","paid time","paid date","payment time",
-                 "tarif","nominal","amount","total","harga",
-                 "st bayar","status bayar","status",
-                 "bank","payment channel","channel","payment method","bank/ewallet"]
-    usecols = lambda c: any(k in str(c).lower() for k in need_keys)
+    need = ["created","create date","created date","created (wib)","created time","tanggal",
+            "paid","paid time","paid date","payment","payment time","payment date","bayar",
+            "tarif","nominal","amount","total","harga",
+            "st bayar","status bayar","status",
+            "bank","payment channel","channel","payment method","bank/ewallet"]
+    usecols = lambda c: any(k in str(c).lower() for k in need)
     buf.seek(0); df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols)
     if len(df.columns)==0: buf.seek(0); df = _read_excel_by_ext(buf, name, header=header_row)
-    df["__source__"] = name; return df
+    df["__source__"]=name; return df
 
 # ---- Settlement readers ----
 SETTLE_TARGETS = ["transaction date","trans date","tanggal transaksi","tgl transaksi","tanggal trans","tgl trans",
@@ -196,17 +184,10 @@ def _parse_settle_any_cached(data: bytes, name: str) -> pd.DataFrame:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return _read_settle_from_bytes(io.BytesIO(data), name)
 
-def _concat_tiket_files(files) -> pd.DataFrame:
-    frames=[]; 
+def _concat(files, reader):
+    frames=[]
     for f in (files or []):
-        df=_parse_tiket_any_cached(_bytes_of(f), f.name)
-        if not df.empty: frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-def _concat_settle_files(files) -> pd.DataFrame:
-    frames=[]; 
-    for f in (files or []):
-        df=_parse_settle_any_cached(_bytes_of(f), f.name)
+        df = reader(_bytes_of(f), f.name)
         if not df.empty: frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -223,13 +204,33 @@ def _month_selector() -> Tuple[int,int]:
     with c2: sel=st.selectbox("Bulan", months, index=int(today.strftime("%m"))-1, format_func=lambda x:x[1]); month=int(sel[0])
     return year, month
 
-def _derive_action_date_from_created(sr: pd.Series, zone: str, *, adjust_midnight: bool=True) -> pd.Series:
-    dt=_to_datetime_series(sr); base=dt.dt.normalize()
-    if not adjust_midnight: return base
-    z=zone.upper(); minus=1 if "WITA" in z else (2 if "WIT" in z else 0)
-    if minus==0: return base
-    shift = pd.to_timedelta((dt.dt.hour.eq(0)).astype(int)*minus, unit="D")
-    return base - shift
+TICKET_DATE_PREFS = [
+    "Paid Time","Paid Date","Payment Time","Payment Date","Tanggal Bayar","Waktu Bayar",
+    "Created","Created Date","Create Date","Tanggal Buat","Created (WIB)","Created Time","Tanggal"
+]
+def _pick_ticket_date_col(df: pd.DataFrame) -> Optional[str]:
+    for name in TICKET_DATE_PREFS:
+        c = _find_col(df, [name])
+        if c is not None:
+            return c
+    return None
+
+def _derive_action_date_smart(sr: pd.Series, zone: str, *, adjust_midnight: bool=True) -> pd.Series:
+    """Geser -1/-2 hari hanya jika jam==00 dan:
+       - string baris mengandung WITA/WIT, ATAU
+       - tidak ada label tapi zona global (sidebar) WITA/WIT (fallback)."""
+    dt = _to_datetime_series(sr)
+    base = dt.dt.normalize()
+    if not adjust_midnight:
+        return base
+    raw = sr.astype(str).str.lower()
+    row_minus = np.where(raw.str.contains("wita"), 1,
+                 np.where(raw.str.contains("wit"), 2, 0)).astype(int)
+    z = zone.lower()
+    global_minus = 1 if "wita" in z else (2 if "wit" in z else 0)
+    minus = np.where(row_minus > 0, row_minus, global_minus)
+    shift = (dt.dt.hour.eq(0)).astype(int) * minus
+    return base - pd.to_timedelta(shift, unit="D")
 
 # ========= App =========
 
@@ -238,14 +239,12 @@ st.title("Rekonsiliasi: Tiket Detail vs Settlement Dana")
 
 with st.sidebar:
     st.header("1) Upload Sumber (multi-file)")
-    tiket_files = st.file_uploader("Tiket Detail (.csv/.xls/.xlsx/.xlsb/.zip)",
-                                   type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
-    settle_files = st.file_uploader("Settlement Dana (.csv/.xls/.xlsx/.xlsb/.zip)",
-                                    type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
+    tiket_files  = st.file_uploader("Tiket Detail (.csv/.xls/.xlsx/.xlsb/.zip)", type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
+    settle_files = st.file_uploader("Settlement Dana (.csv/.xls/.xlsx/.xlsb/.zip)", type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
 
 # gabung (cached)
-tiket_df  = _concat_tiket_files(tiket_files)
-settle_df = _concat_settle_files(settle_files)
+tiket_df  = _concat(tiket_files,  _parse_tiket_any_cached)
+settle_df = _concat(settle_files, _parse_settle_any_cached)
 
 with st.sidebar:
     st.header("2) Parameter Bulan & Tahun (WAJIB)")
@@ -254,36 +253,33 @@ with st.sidebar:
     month_end   = pd.Timestamp(y,m,calendar.monthrange(y,m)[1])
     st.caption(f"Periode: {month_start.date()} s/d {month_end.date()}")
 
-    st.header("3) Zona Waktu Cabang")
-    zone = st.selectbox("Zona waktu", ["WIB (UTC+7)","WITA (UTC+8)","WIT (UTC+9)"], index=0)
-    adjust_midnight = st.checkbox("Koreksi jam 00 (WITA −1 hari, WIT −2 hari)", value=False)
-
-    st.header("4) Opsi")
-    # NEW: pilih kolom tanggal tiket
-    t_date_choice = None
+    st.header("3) Zona/Tanggal Tiket")
+    zone = st.selectbox("Zona (fallback jika tidak ada label di data)", ["WIB (UTC+7)","WITA (UTC+8)","WIT (UTC+9)"], index=0)
+    adjust_midnight = st.checkbox("Koreksi jam 00 (lihat catatan di atas)", value=True)
+    manual_date_col = None
     if not tiket_df.empty:
-        date_candidates = [c for c in tiket_df.columns if any(k in str(c).lower() for k in
-                          ["created","create date","created date","created (wib)","created time","tanggal",
-                           "paid","payment","bayar","paid time","paid date","payment time"])]
-        date_candidates = list(dict.fromkeys(date_candidates))  # unique, keep order
-        if date_candidates:
-            t_date_choice = st.selectbox("Tanggal acuan Tiket", options=date_candidates, index=0, help="Pilih kolom tanggal untuk agregasi tiket (default: Created).")
-    show_charts = st.checkbox("Tampilkan grafik ringkas", value=True)
+        cand = [c for c in tiket_df.columns if any(k in str(c).lower() for k in ["created","paid","payment","bayar","time","date","tanggal","waktu"])]
+        cand = list(dict.fromkeys(cand))
+        if cand:
+            manual_date_col = st.selectbox("Tanggal acuan Tiket (opsional)", options=["(Auto)"]+cand, index=0)
 
+    show_charts = st.checkbox("Tampilkan grafik ringkas", value=True)
     go = st.button("Proses", type="primary", use_container_width=True)
 
 if go:
-    if not tiket_files:
+    if tiket_df.empty:
         st.error("Harap upload **Tiket Detail** minimal 1 file."); st.stop()
 
-    # ---- Tiket ----
-    t_created_default = _find_col(tiket_df, ["Created","Created Date","Create Date","Tanggal Buat","Created (WIB)","Created Time","Tanggal"])
+    # -------- Tiket --------
     t_amt  = _find_col(tiket_df, ["tarif","nominal","amount","total","harga"])
     t_stat = _find_col(tiket_df, ["St Bayar","Status Bayar","status bayar","status"])
     t_bank = _find_col(tiket_df, ["Bank","Payment Channel","channel","payment method","bank/ewallet"])
 
+    ticket_date_col = None if manual_date_col == "(Auto)" else manual_date_col
+    ticket_date_col = ticket_date_col or _pick_ticket_date_col(tiket_df)
+
     missing=[]
-    if (t_date_choice or t_created_default) is None: missing.append("Tiket Detail: kolom tanggal (Created / Paid / Payment)")
+    if ticket_date_col is None: missing.append("Tiket Detail: kolom tanggal (Paid/Payment/Created)")
     if t_amt is None:  missing.append("Tiket Detail: tarif/nominal")
     if t_stat is None: missing.append("Tiket Detail: St Bayar/Status")
     if t_bank is None: missing.append("Tiket Detail: Bank/Channel")
@@ -291,13 +287,11 @@ if go:
         st.error("Kolom wajib tidak ditemukan → " + "; ".join(missing))
         st.write("Kolom Tiket tersedia:", list(tiket_df.columns)); st.stop()
 
-    ticket_date_col = t_date_choice or t_created_default
-
     td = tiket_df.copy()
-    td["__action_date"] = _derive_action_date_from_created(td[ticket_date_col], zone, adjust_midnight=adjust_midnight)
+    td["__action_date"] = _derive_action_date_smart(td[ticket_date_col], zone, adjust_midnight=adjust_midnight)
     td = td[~td["__action_date"].isna()]
 
-    # filter status longgar + bank espay (fuzzy)
+    # status OK & bank espay (fuzzy)
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
     ok   = td_stat_v.str.contains(r"paid|success|settle|lunas|berhasil", regex=True)
     bad  = td_stat_v.str.contains(r"unpaid|pending|gagal|cancel|void|expired|refund", regex=True)
@@ -311,7 +305,7 @@ if go:
     tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    # ---- Settlement (TXN DATE + AMOUNT only) ----
+    # -------- Settlement (Transaction Date + Settlement Amount only) --------
     s_txn_date = _find_col(settle_df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi","Tanggal Trans","Tgl Trans"])
     s_amt = _find_col(settle_df, ["Settlement Ammount","Settlement Amount","Amount Settlement","Nominal Settlement","Amount","Nominal","Jumlah","Total Amount","Net Settlement Amount","Net Settlement"])
     s_settle_date = _find_col(settle_df, ["Settlement Date","SettlementDate","Tanggal Settlement","Tgl Settlement"])
@@ -321,8 +315,7 @@ if go:
     if s_txn_date is None: miss2.append("Settlement: Transaction Date")
     if s_amt is None:      miss2.append("Settlement: Settlement Amount/Ammount")
     if miss2:
-        st.error("Kolom wajib tidak ditemukan → " + "; ".join(miss2))
-        st.write("Kolom Settlement tersedia:", list(settle_df.columns)); st.stop()
+        st.error("Kolom wajib tidak ditemukan → " + "; ".join(miss2)); st.write("Kolom Settlement tersedia:", list(settle_df.columns)); st.stop()
 
     sd_txn = settle_df.copy()
     sd_txn[s_txn_date] = _to_datetime_series(sd_txn[s_txn_date]).dt.normalize()
@@ -332,7 +325,7 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA opsional
+    # BCA/Non-BCA (opsional; tidak mempengaruhi kolom utama)
     if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
         sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
@@ -347,7 +340,7 @@ if go:
     else:
         settle_bca = pd.Series(dtype=float); settle_nonbca = pd.Series(dtype=float)
 
-    # ---- Reindex & table ----
+    # -------- Reindex & table --------
     idx = pd.Index(pd.date_range(month_start, month_end, freq="D").date, name="Tanggal")
     def _reidx(s: pd.Series) -> pd.Series:
         if not isinstance(s, pd.Series): s = pd.Series(dtype=float)
@@ -355,9 +348,9 @@ if go:
         return s.reindex(idx, fill_value=0.0)
 
     final = pd.DataFrame(index=idx)
-    final["Tiket Detail ESPAY"]    = _reidx(tiket_by_date).values
-    final["Settlement Dana ESPAY"] = _reidx(settle_total).values
-    final["Selisih"]               = final["Tiket Detail ESPAY"] - final["Settlement Dana ESPAY"]
+    final["Tiket Detail ESPAY"]      = _reidx(tiket_by_date).values
+    final["Settlement Dana ESPAY"]   = _reidx(settle_total).values
+    final["Selisih"]                 = final["Tiket Detail ESPAY"] - final["Settlement Dana ESPAY"]
     final["Settlement Dana BCA"]     = _reidx(settle_bca).values
     final["Settlement Dana Non BCA"] = _reidx(settle_nonbca).values
 
