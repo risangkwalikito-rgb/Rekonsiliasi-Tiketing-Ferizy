@@ -1,12 +1,11 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
 """
-Rekonsiliasi otomatis:
-- Tiket Detail (Excel/CSV/ZIP): pakai kolom 'Created' (tanggal+jam) → ambil tanggalnya (date-only),
-  jumlahkan 'Tarif/Nominal/Amount' per tanggal.
-- Report Settlement (CSV/ZIP): pakai 'Transaction Date' + 'Settlement Amount/Ammount',
-  jumlahkan per tanggal.
-- Tabel hasil = join per tanggal (outer), lengkap selisih & ekspor Excel.
+Rekonsiliasi otomatis (ZIP-ready) dengan deteksi header cerdas:
+- Tiket Detail (Excel/CSV/ZIP): ambil 'Created' (tanggal+jam) → tarik tanggal saja; jumlahkan 'Tarif/Nominal/Amount' per tanggal.
+- Report Settlement (CSV/ZIP): ambil 'Transaction Date' + 'Settlement Amount/Ammount'; jumlahkan per tanggal.
+- Jika baris pertama Excel adalah judul/merge, pembaca akan otomatis mencoba header=1 atau menebak baris header.
+- Hasil di-join per tanggal, tampil + ekspor Excel.
 """
 
 from __future__ import annotations
@@ -33,7 +32,6 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def _to_datetime_series(sr: pd.Series) -> pd.Series:
-    """Parse tanggal jam: dukung string ID/EN & Excel serial."""
     if sr.empty:
         return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
     s = sr.astype(str).str.strip()
@@ -53,7 +51,6 @@ def _to_datetime_series(sr: pd.Series) -> pd.Series:
     return dt
 
 def _to_money(sr: pd.Series) -> pd.Series:
-    """Parser uang robust: 1.095.568.800 / 1,095,568,800.00 / (123) / 123-"""
     def p(x) -> float:
         if x is None: return 0.0
         s = str(x).strip().lower()
@@ -84,79 +81,138 @@ def _idr(n: float) -> str:
     s = f"{abs(int(round(n))):,}".replace(",", ".")
     return f"({s})" if n < 0 else s
 
+# ========== header guessing helpers ==========
+
+def _guess_header_row(df_no_header: pd.DataFrame, targets: List[str], scan_rows: int = 25) -> int:
+    scan = min(scan_rows, len(df_no_header))
+    best_row, best = 0, -1
+    tgt = [t.lower() for t in targets]
+    for i in range(scan):
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
+        text = " ".join(row.tolist())
+        score = sum(1 for t in tgt if t in text)
+        if score > best:
+            best_row, best = i, score
+            if score >= 3:
+                break
+    return best_row
+
 # ========== readers (cached) ==========
 
 @st.cache_data(show_spinner=False)
 def _bytes_of(uploaded) -> bytes:
     uploaded.seek(0); data = uploaded.read(); uploaded.seek(0); return data
 
-def _read_excel_bytes(data: bytes, name: str) -> pd.DataFrame:
+def _read_excel_by_name(data: bytes, name: str, header=None) -> pd.DataFrame:
     low = name.lower()
     if low.endswith(".xlsb"):
-        return pd.read_excel(io.BytesIO(data), engine="pyxlsb", dtype=str, na_filter=False)
+        return pd.read_excel(io.BytesIO(data), engine="pyxlsb", dtype=str, na_filter=False, header=header)
     if low.endswith(".xlsx"):
-        return pd.read_excel(io.BytesIO(data), engine="openpyxl", dtype=str, na_filter=False)
+        return pd.read_excel(io.BytesIO(data), engine="openpyxl", dtype=str, na_filter=False, header=header)
     if low.endswith(".xls"):
-        return pd.read_excel(io.BytesIO(data), engine="xlrd", dtype=str, na_filter=False)
-    # fallback CSV if misnamed
-    return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, encoding="utf-8-sig")
+        return pd.read_excel(io.BytesIO(data), engine="xlrd", dtype=str, na_filter=False, header=header)
+    # fallback CSV when mislabeled
+    return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, header=header if header in (None, 0, 1) else "infer", encoding="utf-8-sig")
 
-def _read_csv_bytes(data: bytes) -> pd.DataFrame:
+def _read_csv_auto(data: bytes, header="infer") -> pd.DataFrame:
     try:
-        return pd.read_csv(io.BytesIO(data), dtype=str, na_filter=False, encoding="utf-8-sig")
+        return pd.read_csv(io.BytesIO(data), dtype=str, na_filter=False, header=header, encoding="utf-8-sig")
     except Exception:
-        return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, encoding="utf-8-sig")
+        return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, header=header, encoding="utf-8-sig")
 
+# --- SMART: Tiket (Excel/CSV) ---
 @st.cache_data(show_spinner=False)
 def read_tiket_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
-    """Baca Tiket: file tunggal (xlsx/xls/xlsb/csv) atau ZIP berisi gabungan."""
-    read_files = []
-    frames = []
+    read_files, frames = [], []
     low = name.lower()
+    targets = ["created","created date","create date","created (wib)","created time","tanggal",
+               "tarif","nominal","amount","total","harga"]
+    # function to validate if required cols exist
+    def _has_required(df: pd.DataFrame) -> bool:
+        return (_find_col(df, ["Created","Created Date","Create Date","Created (WIB)","Created Time","Tanggal","Tanggal Buat"]) is not None
+                and _find_col(df, ["Tarif","Nominal","Amount","Total","Harga"]) is not None)
+
+    def _read_one(b: bytes, nm: str):
+        df = pd.DataFrame()
+        nm_low = nm.lower()
+        # Excel-like
+        if nm_low.endswith((".xlsx",".xls",".xlsb")):
+            for hdr in (0, 1):   # try header row 0, then ignore first row
+                df = _read_excel_by_name(b, nm, header=hdr)
+                if _has_required(df): return df
+            # header guessing
+            peek = _read_excel_by_name(b, nm, header=None)
+            hdr_row = _guess_header_row(peek, targets)
+            df = _read_excel_by_name(b, nm, header=hdr_row)
+            return df
+        # CSV
+        if nm_low.endswith(".csv"):
+            for hdr in ("infer", 0, 1):
+                df = _read_csv_auto(b, header=hdr)
+                if _has_required(df): return df
+            # guess header from first 25 rows
+            peek = _read_csv_auto(b, header=None).head(25)
+            hdr_row = _guess_header_row(peek, targets)
+            df = _read_csv_auto(b, header=hdr_row)
+            return df
+        return df
+
     if low.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for info in zf.infolist():
                 if info.is_dir(): continue
                 nm = info.filename
                 if not nm.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
-                with zf.open(info) as f:
-                    b = f.read()
-                df = _read_excel_bytes(b, nm) if nm.lower().endswith((".xlsx",".xls",".xlsb")) else _read_csv_bytes(b)
-                if not df.empty:
-                    frames.append(df); read_files.append(nm)
+                with zf.open(info) as f: b = f.read()
+                df = _read_one(b, nm)
+                if not df.empty: frames.append(df); read_files.append(nm)
     else:
-        df = _read_excel_bytes(data, name) if low.endswith((".xlsx",".xls",".xlsb")) else (
-             _read_csv_bytes(data) if low.endswith(".csv") else pd.DataFrame())
+        df = _read_one(data, name)
         if not df.empty: frames.append(df); read_files.append(name)
+
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return out, read_files
 
+# --- SMART: Settlement (CSV only) ---
 @st.cache_data(show_spinner=False)
 def read_settle_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
-    """Baca Settlement: CSV tunggal atau ZIP berisi banyak CSV."""
-    read_files = []
-    frames = []
+    read_files, frames = [], []
     low = name.lower()
+    targets = ["transaction date","trans date","tanggal transaksi","tgl transaksi",
+               "settlement ammount","settlement amount","amount settlement","nominal settlement","amount"]
+    def _has_required(df: pd.DataFrame) -> bool:
+        return (_find_col(df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi"]) is not None
+                and _find_col(df, ["Settlement Amount","Settlement Ammount","Amount Settlement","Nominal Settlement","Amount"]) is not None)
+
+    def _read_one_csv(b: bytes, nm: str):
+        for hdr in ("infer", 0, 1):
+            df = _read_csv_auto(b, header=hdr)
+            if _has_required(df): return df
+        peek = _read_csv_auto(b, header=None).head(25)
+        hdr_row = _guess_header_row(peek, targets)
+        df = _read_csv_auto(b, header=hdr_row)
+        return df
+
     if low.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for info in zf.infolist():
                 if info.is_dir(): continue
                 nm = info.filename
                 if not nm.lower().endswith(".csv"): continue
-                with zf.open(info) as f:
-                    b = f.read()
-                df = _read_csv_bytes(b)
-                if not df.empty:
-                    frames.append(df); read_files.append(nm)
+                with zf.open(info) as f: b = f.read()
+                df = _read_one_csv(b, nm)
+                if not df.empty: frames.append(df); read_files.append(nm)
     else:
-        df = _read_csv_bytes(data) if low.endswith(".csv") else pd.DataFrame()
-        if not df.empty: frames.append(df); read_files.append(name)
+        if low.endswith(".csv"):
+            df = _read_one_csv(data, name)
+            if not df.empty: frames.append(df); read_files.append(name)
+
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return out, read_files
 
 # ========== app UI ==========
 
-st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement (ZIP-ready)", layout="wide")
+st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement (Smart Header + ZIP)", layout="wide")
 st.title("Rekonsiliasi Otomatis: Tiket Detail vs Report Settlement")
 
 col1, col2 = st.columns(2)
@@ -237,9 +293,10 @@ if go:
     st.subheader("Hasil Rekonsiliasi per Tanggal")
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
-    with st.expander("📦 File yang dibaca"):
+    with st.expander("📦 File yang dibaca & deteksi header"):
         st.write("Tiket Detail:", tiket_read or "(tidak ada)")
         st.write("Settlement:", settle_read or "(tidak ada)")
+        st.caption("Pembaca mencoba header=0, header=1 (abaikan baris 1), lalu menebak baris header jika masih gagal.")
 
     if show_chart and not df.empty:
         st.subheader("Grafik Ringkas")
