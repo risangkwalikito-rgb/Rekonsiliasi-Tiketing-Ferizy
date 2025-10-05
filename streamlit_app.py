@@ -1,386 +1,418 @@
-# rekon_tiket_espay_app.py
-# -------------------------------------------------------------
-# Rekonsiliasi Tiket Detail (Created -> Action) vs Settlement ESPAY
-# - Ticket Detail: Excel/CSV/ZIP (ZIP berisi CSV/XLSX/XLS)
-# - Settlement : CSV/ZIP/Excel
-# - Header-detection: cari baris header di 30 baris awal (mengatasi merge/judul)
-# - Ekstrak 'Created' -> 'Action' (tanggal), agregasi & rekonsiliasi per tanggal
-#
-# Jalankan:
-#   pip install streamlit pandas openpyxl xlsxwriter
-#   streamlit run rekon_tiket_espay_app.py
+# app.py
+# -*- coding: utf-8 -*-
+"""
+Rekonsiliasi: Tiket Detail vs Settlement Dana
+- Bulan & Tahun → tanggal 1..akhir bulan
+- Multi-file upload (Tiket Excel; Settlement CSV/Excel)
+- Tiket: Action dihitung dari 'Created' (+ shift midnight WIB 0 / WITA -1 / WIT -2), filter St Bayar='paid' & Bank contains 'espay'
+- Settlement Dana ESPAY: Transaction Date
+- Settlement Dana BCA/Non BCA: Settlement Date (Product Name='BCA VA Online')
+"""
+
+from __future__ import annotations
 
 import io
 import re
-import zipfile
-from typing import List, Tuple, Optional
+import calendar
+from typing import Optional, List, Tuple, Iterable
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from dateutil import parser as dtparser
 
-# ========================= Utilities =========================
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+# ---------- Helpers ----------
 
-def _find_header_row(raw_df: pd.DataFrame) -> int:
-    """
-    Temukan baris header dengan memindai 30 baris awal dan mencari keywords.
-    Mengatasi kasus ada judul/merge di baris atas.
-    """
-    keywords = [
-        "created", "waktu validasi", "tanggal", "tgl", "date",
-        "transaksi", "paid", "posting", "settlement", "action"
-    ]
-    max_scan = min(30, len(raw_df))
-    for i in range(max_scan):
-        row = raw_df.iloc[i].astype(str).str.strip().str.lower().tolist()
-        if any(any(kw in cell for kw in keywords) for cell in row):
-            return i
-    return 0  # fallback
-
-def _read_excel_bytes_smart(data: bytes) -> List[pd.DataFrame]:
-    """Baca Excel dengan deteksi baris header (anti-merge/judul)."""
-    buf = io.BytesIO(data)
-    xls = pd.ExcelFile(buf)
-    dfs = []
-    for sh in xls.sheet_names:
-        raw = pd.read_excel(xls, sheet_name=sh, header=None, dtype=object)
-        hdr = _find_header_row(raw)
-        df  = pd.read_excel(io.BytesIO(data), sheet_name=sh, header=hdr, dtype=object)
-        df = _normalize_columns(df)
-        dfs.append(df)
-    return dfs
-
-def _read_csv_bytes(data: bytes) -> pd.DataFrame:
-    buf = io.BytesIO(data)
+def _parse_money(val) -> float:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return 0.0
+    if isinstance(val, (int, float, np.number)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return 0.0
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1].strip()
+    if s.endswith("-"):
+        neg, s = True, s[:-1].strip()
+    s = re.sub(r"(idr|rp|cr|dr)", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[^0-9\.,\-]", "", s).strip()
+    if s.startswith("-"):
+        neg, s = True, s[1:].strip()
+    d, c = s.rfind("."), s.rfind(",")
+    if d == -1 and c == -1:
+        num_s = s
+    elif d > c:
+        num_s = s.replace(",", "")
+    else:
+        num_s = s.replace(".", "").replace(",", ".")
     try:
-        return pd.read_csv(buf, dtype=object)
+        num = float(num_s)
     except Exception:
-        buf.seek(0)
-        return pd.read_csv(buf, dtype=object, sep=";")
+        num_s = s.replace(".", "").replace(",", "")
+        num = float(num_s) if num_s else 0.0
+    return -num if neg else num
 
-def _find_created_col(df: pd.DataFrame) -> Optional[str]:
-    cols = [str(c).strip() for c in df.columns]
-    for c in cols:
-        if c.lower() == "created":
-            return c
-    for c in cols:
-        if "created" in c.lower():
-            return c
-    for c in cols:
-        if re.search(r"(dibuat|tgl.*buat|tanggal.*buat)", c.lower()):
-            return c
+
+def _to_num(sr: pd.Series) -> pd.Series:
+    return sr.apply(_parse_money).astype(float)
+
+
+def _to_datetime(val) -> Optional[pd.Timestamp]:
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float, np.number)):
+        if np.isfinite(val) and 1 <= float(val) <= 100000:
+            base = pd.Timestamp("1899-12-30")
+            try:
+                return base + pd.to_timedelta(float(val), unit="D")
+            except Exception:
+                return None
+        return None
+    if isinstance(val, (pd.Timestamp, np.datetime64)):
+        return pd.to_datetime(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    for dayfirst in (True, False):
+        try:
+            return pd.Timestamp(dtparser.parse(s, dayfirst=dayfirst, fuzzy=True))
+        except Exception:
+            continue
     return None
 
-def normalize_created_action(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
-    """
-    Pastikan ada:
-      - 'Created' : 'dd/mm/YYYY HH:MM:SS'
-      - 'Action'  : 'dd/mm/YYYY'
-    """
-    df = _normalize_columns(df.copy())
-    created_col = _find_created_col(df)
-    if created_col is None:
-        return df, "Kolom 'Created' tidak ditemukan."
 
-    s = df[created_col]
-    if pd.api.types.is_datetime64_any_dtype(s):
-        created_dt = pd.to_datetime(s, errors="coerce")
-        df["Created"] = created_dt.dt.strftime("%d/%m/%Y %H:%M:%S")
-        df["Action"]  = created_dt.dt.strftime("%d/%m/%Y")
-    else:
-        s = s.astype(str).str.strip()
-        s = s.str.replace("T", " ", regex=False) \
-             .str.replace(r"([+-]\d{2}:?\d{2}|Z)$", "", regex=True)
-        d = s.str.slice(0, 10)
-        t = s.str.slice(11, 19)
-        d1 = pd.to_datetime(d, errors="coerce", dayfirst=True)
-        d2 = pd.to_datetime(d, errors="coerce", format="%Y-%m-%d")
-        dp = d1.fillna(d2)
-        df["Created"] = dp.dt.strftime("%d/%m/%Y").fillna(d) + " " + t.fillna("00:00:00")
-        df["Action"]  = dp.dt.strftime("%d/%m/%Y")
+def _to_date(val) -> Optional[pd.Timestamp]:
+    dt = _to_datetime(val)
+    return dt.normalize() if dt is not None else None
 
-    # bersihkan sisa perantara
-    for col in list(df.columns):
-        if str(col).lower() in ["created_date_str", "created_time_str"]:
-            del df[col]
-    for col in list(df.columns):
-        if str(col).lower() == "action" and col != "Action":
-            del df[col]
-    return df, "OK"
 
-def ensure_action_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Anti-KeyError: pastikan 'Action' ada (turunkan dari Created / tanggal lain)."""
-    if "Action" in df.columns and not df["Action"].isna().all():
+def _norm_label(s: str) -> str:
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    s = str(s).strip().lower()
+    return re.sub(r"\s+", " ", s)
+
+
+def _find_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    if df.empty:
+        return None
+    cols = [c for c in df.columns if isinstance(c, str)]
+    m = {c.lower().strip(): c for c in cols}
+    for n in names:
+        k = n.lower().strip()
+        if k in m:
+            return m[k]
+    for n in names:  # substring match
+        key = n.lower().strip()
+        for c in cols:
+            if key in c.lower():
+                return c
+    return None
+
+
+def _idr_fmt(n: float) -> str:
+    if pd.isna(n):
+        return "-"
+    neg = n < 0
+    s = f"{abs(int(round(n))):,}".replace(",", ".")
+    return f"({s})" if neg else s
+
+
+# ---------- Readers (header guessing) ----------
+
+def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
+    scan = min(20, len(df_no_header))
+    best_row, best_score = 0, -1
+    for i in range(scan):
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
+        text = " ".join(row.tolist())
+        score = sum(1 for t in targets if t in text)
+        if score > best_score:
+            best_row, best_score = i, score
+            if score >= 3:
+                break
+    return best_row
+
+
+def _read_tiket_file(f) -> pd.DataFrame:
+    """Baca Excel Tiket dengan auto-deteksi header (atasi baris judul/merge)."""
+    try:
+        f.seek(0)
+        raw = pd.read_excel(f, engine="openpyxl", header=None, dtype=str)
+        if raw.empty:
+            return pd.DataFrame()
+        targets = ["created", "action", "tarif", "st bayar", "status", "bank", "channel"]
+        header_row = _guess_header_row(raw, targets)
+        f.seek(0)
+        df = pd.read_excel(f, engine="openpyxl", header=header_row, dtype=str)
+        df["__source__"] = f.name
         return df
+    except Exception as e:
+        st.error(f"Gagal membaca Tiket: {f.name} → {e}")
+        return pd.DataFrame()
 
-    # 1) Dari Created
-    cand = [c for c in df.columns if str(c).strip().lower() == "created" or "created" in str(c).strip().lower()]
-    if cand:
-        col = cand[0]
-        s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            df["Action"] = pd.to_datetime(s, errors="coerce").dt.strftime("%d/%m/%Y")
+
+def _read_settle_file(f) -> pd.DataFrame:
+    try:
+        low = f.name.lower()
+        if low.endswith(".csv"):
+            for enc in ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1"):
+                try:
+                    f.seek(0)
+                    df = pd.read_csv(f, encoding=enc, sep=None, engine="python", dtype=str, na_filter=False)
+                    df["__source__"] = f.name
+                    return df
+                except Exception:
+                    continue
+            st.error(f"CSV gagal dibaca: {f.name}. Simpan ulang sebagai UTF-8.")
+            return pd.DataFrame()
+        else:
+            f.seek(0)
+            df = pd.read_excel(f, engine="openpyxl", dtype=str)
+            df["__source__"] = f.name
             return df
-        s = s.astype(str).str.strip()
-        s = s.str.replace("T", " ", regex=False).str.replace(r"([+-]\d{2}:?\d{2}|Z)$", "", regex=True)
-        d  = s.str.slice(0, 10)
-        d1 = pd.to_datetime(d, errors="coerce", dayfirst=True)
-        d2 = pd.to_datetime(d, errors="coerce", format="%Y-%m-%d")
-        df["Action"] = d1.fillna(d2).dt.strftime("%d/%m/%Y")
-        return df
+    except Exception as e:
+        st.error(f"Gagal membaca Settlement: {f.name} → {e}")
+        return pd.DataFrame()
 
-    # 2) Dari kolom tanggal lain
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if any(k in cl for k in ["tanggal","date","transaksi","paid","posting","settlement"]):
-            dparsed = pd.to_datetime(df[c], dayfirst=True, errors="coerce")
-            if dparsed.notna().any():
-                df["Action"] = dparsed.dt.strftime("%d/%m/%Y")
-                return df
 
-    # 3) Fallback
-    df["Action"] = pd.NaT
-    return df
+def _concat(files, reader) -> pd.DataFrame:
+    if not files:
+        return pd.DataFrame()
+    frames = []
+    for f in files:
+        df = reader(f)
+        if not df.empty:
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-def guess_numeric_cols(df: pd.DataFrame) -> List[str]:
-    preferred = {"amount","nominal","nilai","total","harga","tarif","jumlah","grand total","bayar","payment","gross","net"}
-    cols = []
-    for c in df.columns:
-        if pd.api.types.is_numeric_dtype(df[c]):
-            cols.append(str(c))
-        else:
-            smp = df[c].dropna().astype(str).head(20)
-            if not smp.empty and smp.str.replace(r"[0-9\.,\-]", "", regex=True).str.len().max() == 0:
-                cols.append(str(c))
-    return sorted(cols, key=lambda x: (0 if x.strip().lower() in preferred else 1, x))
 
-def guess_date_cols(df: pd.DataFrame) -> List[str]:
-    cands, seen = [], set()
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if any(k in cl for k in ["settlement","posting","tanggal","date","transaksi","paid","created"]) \
-           or pd.api.types.is_datetime64_any_dtype(df[c]):
-            if c not in seen:
-                cands.append(c); seen.add(c)
-    return cands
+# ---------- Business ----------
 
-def parse_currency_series(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors="coerce")
-    x = s.astype(str).str.strip().str.replace(r"\s", "", regex=True)
-    def _one(v: str):
-        if v in ("", "nan", "None", "NaN"):
+def _month_selector() -> Tuple[int, int]:
+    from datetime import date
+    today = date.today()
+    years = list(range(today.year - 5, today.year + 2))
+    months = [("01","Januari"),("02","Februari"),("03","Maret"),("04","April"),
+              ("05","Mei"),("06","Juni"),("07","Juli"),("08","Agustus"),
+              ("09","September"),("10","Oktober"),("11","November"),("12","Desember")]
+    c1, c2 = st.columns(2)
+    with c1:
+        year = st.selectbox("Tahun", years, index=years.index(today.year))
+    with c2:
+        sel = st.selectbox("Bulan", months, index=int(today.strftime("%m"))-1, format_func=lambda x: x[1])
+        month = int(sel[0])
+    return year, month
+
+
+def _derive_action_from_created(created_sr: pd.Series, zone: str) -> pd.Series:
+    """Ambil tanggal dari 'Created' + shift midnight:
+       WIB: 0, WITA: -1, WIT: -2 (00:00–00:59)."""
+    zone = (zone or "").upper()
+    minus_days = 0
+    if "WITA" in zone:
+        minus_days = 1
+    elif "WIT" in zone:
+        minus_days = 2
+
+    def conv(val):
+        dt = _to_datetime(val)
+        if dt is None:
             return None
-        has_dot, has_com = "." in v, "," in v
-        if has_dot and has_com:
-            last_sep = max(v.rfind("."), v.rfind(","))
-            int_d = re.sub(r"[^\d]", "", v[:last_sep])
-            frac_d = re.sub(r"[^\d]", "", v[last_sep+1:])
-            num = int_d + ("." + frac_d if frac_d else "")
-            try: return float(num)
-            except: return None
-        digits = re.sub(r"[^\d\-]", "", v)
-        if digits in ("", "-", "--"): return None
-        try: return float(digits)
-        except: return None
-    return x.map(_one)
+        d = pd.Timestamp(dt.date())
+        if dt.hour == 0 and minus_days > 0:
+            d = d - pd.Timedelta(days=minus_days)  # why: sesuaikan hari operasional lokal
+        return d
 
-# ========================= Readers (CSV/Excel/ZIP) =========================
+    return created_sr.apply(conv)
 
-def read_ticket_files(files) -> pd.DataFrame:
-    """Ticket: XLSX/XLS/CSV/ZIP (ZIP: CSV/XLSX/XLS) + header detection."""
-    frames = []
-    for f in files:
-        name = getattr(f, "name", "uploaded")
-        data = f.read()
 
-        # ZIP
-        if name.lower().endswith(".zip"):
-            zbuf = io.BytesIO(data)
-            with zipfile.ZipFile(zbuf) as z:
-                for zi in z.infolist():
-                    zname = zi.filename
-                    with z.open(zi) as fh:
-                        content = fh.read()
-                        if zname.lower().endswith((".xlsx",".xls")):
-                            try:
-                                dfs = _read_excel_bytes_smart(content)
-                            except Exception:
-                                dfs = [_read_csv_bytes(content)]
-                        elif zname.lower().endswith(".csv"):
-                            dfs = [_read_csv_bytes(content)]
-                        else:
-                            continue
-                        for df in dfs:
-                            df2, _ = normalize_created_action(df)
-                            df2["source_file"] = f"{name}:{zname}"
-                            frames.append(df2)
-            continue
+# ---------- App ----------
 
-        # Non-ZIP
-        try:
-            dfs = _read_excel_bytes_smart(data)
-        except Exception:
-            dfs = [_read_csv_bytes(data)]
-        for i, df in enumerate(dfs):
-            df2, _ = normalize_created_action(df)
-            df2["source_file"] = f"{name}"
-            frames.append(df2)
+st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement", layout="wide")
+st.title("Rekonsiliasi: Tiket Detail vs Settlement Dana")
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+with st.sidebar:
+    st.header("1) Upload Sumber (multi-file)")
+    tiket_files = st.file_uploader("Tiket Detail (Excel .xls/.xlsx)", type=["xls", "xlsx"], accept_multiple_files=True)
+    settle_files = st.file_uploader("Settlement Dana (CSV/Excel)", type=["csv", "xls", "xlsx"], accept_multiple_files=True)
 
-def read_settlement_files(files) -> pd.DataFrame:
-    """Settlement: CSV/ZIP/Excel (ZIP diasumsikan CSV)."""
-    frames = []
-    for f in files:
-        name = getattr(f, "name", "uploaded")
-        data = f.read()
+    st.header("2) Parameter Bulan & Tahun (WAJIB)")
+    y, m = _month_selector()
+    month_start = pd.Timestamp(y, m, 1)
+    month_end   = pd.Timestamp(y, m, calendar.monthrange(y, m)[1])
+    st.caption(f"Periode dipakai: {month_start.date()} s/d {month_end.date()}")
 
-        if name.lower().endswith(".zip"):
-            zbuf = io.BytesIO(data)
-            with zipfile.ZipFile(zbuf) as z:
-                for zi in z.infolist():
-                    if not zi.filename.lower().endswith(".csv"):
-                        continue
-                    with z.open(zi) as fh:
-                        df = _read_csv_bytes(fh.read())
-                    df["source_file"] = f"{name}:{zi.filename}"
-                    frames.append(_normalize_columns(df))
-        else:
-            # Excel or CSV
-            try:
-                dfs = _read_excel_bytes_smart(data)  # pakai header detection juga
-                for i, df in enumerate(dfs):
-                    df["source_file"] = name
-                    frames.append(_normalize_columns(df))
-            except Exception:
-                df = _read_csv_bytes(data)
-                df["source_file"] = name
-                frames.append(_normalize_columns(df))
+    st.header("3) Zona Waktu Cabang")
+    zone = st.selectbox("Zona waktu", ["WIB (UTC+7)", "WITA (UTC+8)", "WIT (UTC+9)"], index=0)
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    go = st.button("Proses", type="primary", use_container_width=True)
 
-# ========================= Aggregations =========================
+tiket_df  = _concat(tiket_files, _read_tiket_file)
+settle_df = _concat(settle_files, _read_settle_file)
 
-def aggregate_ticket_by_action(df: pd.DataFrame, amount_col: Optional[str]) -> pd.DataFrame:
-    df = ensure_action_column(df)
-    if "Action" not in df.columns or df["Action"].isna().all():
-        return pd.DataFrame(columns=["Tanggal", "Tiket Detail ESPAY"])
-    tmp = df.copy()
-    tmp["Action_dt"] = pd.to_datetime(tmp["Action"], dayfirst=True, errors="coerce").dt.date
-    tmp = tmp.dropna(subset=["Action_dt"])
-    if amount_col is None:
-        g = tmp.groupby("Action_dt", dropna=False).size().reset_index(name="Tiket Detail ESPAY")
-    else:
-        val = parse_currency_series(tmp[amount_col])
-        g = tmp.assign(_val=val).groupby("Action_dt", dropna=False)["_val"].sum(min_count=1).reset_index()
-        g = g.rename(columns={"_val": "Tiket Detail ESPAY"})
-    g = g.rename(columns={"Action_dt": "Tanggal"}).sort_values("Tanggal").reset_index(drop=True)
-    return g
+if go:
+    # --- Auto mapping dengan sinonim kolom ---
+    created_candidates = ["created", "created date", "create date", "created (wib)", "created time",
+                          "action", "action date", "tanggal", "tgl"]
+    amount_candidates  = ["tarif", "fare", "amount", "nominal", "total", "harga"]
+    status_candidates  = ["st bayar", "status bayar", "status"]
+    bank_candidates    = ["bank", "payment channel", "channel", "payment method", "bank/ewallet"]
 
-def aggregate_settlement_by_date(df: pd.DataFrame, date_col: str, amount_col: str) -> pd.DataFrame:
-    tmp = df.copy()
-    tmp["Tanggal"] = pd.to_datetime(tmp[date_col], dayfirst=True, errors="coerce").dt.date
-    val = parse_currency_series(tmp[amount_col])
-    g = tmp.assign(_val=val).groupby("Tanggal", dropna=False)["_val"].sum(min_count=1).reset_index()
-    g = g.rename(columns={"_val": "Settlement Dana ESPAY"})
-    return g
+    t_created = _find_col(tiket_df, created_candidates)
+    t_amt     = _find_col(tiket_df, amount_candidates)
+    t_stat    = _find_col(tiket_df, status_candidates)
+    t_bank    = _find_col(tiket_df, bank_candidates)
 
-# ========================= Streamlit UI =========================
+    s_txn_date    = _find_col(settle_df, ["Transaction Date", "Trans Date", "Tanggal Transaksi"])
+    s_settle_date = _find_col(settle_df, ["Settlement Date", "SettlementDate", "Tanggal Settlement"])
+    s_amt         = _find_col(settle_df, ["Settlement Amount", "Amount Settlement", "Nominal Settlement", "Amount"])
+    s_prod        = _find_col(settle_df, ["Product Name", "Product", "ProductName", "Nama Produk"])
 
-st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement ESPAY", layout="wide")
-st.title("Rekonsiliasi Tiket vs Settlement ESPAY")
-st.caption("• Ticket: Excel/CSV/ZIP → 'Created'→'Action' (header auto-detect) • Settlement: CSV/ZIP/Excel.")
+    missing = []
+    if t_created is None: missing.append("Tiket Detail: Created/Action")
+    if t_amt is None:     missing.append("Tiket Detail: tarif/amount")
+    if t_stat is None:    missing.append("Tiket Detail: St Bayar/Status")
+    if t_bank is None:    missing.append("Tiket Detail: Bank/Channel")
 
-with st.expander("1) Upload Ticket Detail (Excel/CSV/ZIP)"):
-    ticket_files = st.file_uploader(
-        "Upload banyak file Ticket Detail",
-        type=["xlsx","xls","csv","zip"],
-        accept_multiple_files=True,
-        key="ticket")
-    if ticket_files:
-        tickets_df = read_ticket_files(ticket_files)
-        tickets_df = ensure_action_column(tickets_df)
-        st.write("Preview kolom utama Ticket Detail:")
-        keep = [c for c in tickets_df.columns if str(c).lower() in ["created","action","source_file"]]
-        st.dataframe(tickets_df[keep].head(200), use_container_width=True)
-        ticket_num_cols = guess_numeric_cols(tickets_df)
-        ticket_amt = st.selectbox("Kolom nominal Ticket (opsional; kosong = hitung jumlah tiket)",
-                                  options=["(hitung jumlah tiket)"] + ticket_num_cols, index=0)
-        ticket_amt_col = None if ticket_amt == "(hitung jumlah tiket)" else ticket_amt
-    else:
-        tickets_df = pd.DataFrame()
-        ticket_amt_col = None
+    # ----- Mapping manual jika auto gagal -----
+    if missing:
+        with st.expander("⚙️ Map kolom Tiket secara manual (auto tidak menemukan)"):
+            st.write("Pilih kolom yang sesuai dari daftar berikut.")
+            cols = list(tiket_df.columns)
+            def pick(default_keys: List[str]) -> Optional[str]:
+                # pilih default bila ada kandidat yang cocok
+                auto = _find_col(tiket_df, default_keys)
+                return st.selectbox(", ".join(default_keys), ["-- pilih --"] + cols,
+                                    index=(cols.index(auto) + 1) if auto in cols else 0)
+            c_created = pick(created_candidates)
+            c_amt     = pick(amount_candidates)
+            c_stat    = pick(status_candidates)
+            c_bank    = pick(bank_candidates)
 
-with st.expander("2) Upload Settlement ESPAY (CSV/ZIP/Excel)"):
-    settlement_files = st.file_uploader(
-        "Upload banyak file Settlement",
-        type=["csv","zip","xlsx","xls"],
-        accept_multiple_files=True,
-        key="settle")
-    if settlement_files:
-        settle_df = read_settlement_files(settlement_files)
-        st.write("Preview Settlement (kolom tersedia):")
-        st.dataframe(settle_df.head(200), use_container_width=True)
-        date_candidates = guess_date_cols(settle_df)
-        num_candidates  = guess_numeric_cols(settle_df)
-        settle_date_col = st.selectbox("Pilih kolom TANGGAL (Settlement)", 
-                                       options=date_candidates if date_candidates else settle_df.columns.tolist())
-        settle_amt_col  = st.selectbox("Pilih kolom NOMINAL (Settlement)",
-                                       options=num_candidates if num_candidates else settle_df.columns.tolist())
-    else:
-        settle_df = pd.DataFrame()
-        settle_date_col = None
-        settle_amt_col  = None
+        # terapkan pilihan user jika valid
+        if c_created and c_created != "-- pilih --": t_created = c_created
+        if c_amt and c_amt != "-- pilih --":         t_amt     = c_amt
+        if c_stat and c_stat != "-- pilih --":       t_stat    = c_stat
+        if c_bank and c_bank != "-- pilih --":       t_bank    = c_bank
 
-st.subheader("3) Periode Rekonsiliasi")
-c1, c2 = st.columns(2)
-with c1:
-    start_date = st.date_input("Tanggal mulai", value=None)
-with c2:
-    end_date   = st.date_input("Tanggal akhir", value=None)
+    # cek lagi setelah manual mapping
+    missing = []
+    if t_created is None: missing.append("Tiket Detail: Created/Action")
+    if t_amt is None:     missing.append("Tiket Detail: tarif/amount")
+    if t_stat is None:    missing.append("Tiket Detail: St Bayar/Status")
+    if t_bank is None:    missing.append("Tiket Detail: Bank/Channel")
 
-if st.button("Proses"):
-    if tickets_df.empty:
-        st.error("Ticket Detail belum diupload."); st.stop()
-    if settle_df.empty:
-        st.error("Settlement ESPAY belum diupload."); st.stop()
-
-    tickets_df = ensure_action_column(tickets_df)
-    if "Action" not in tickets_df.columns or tickets_df["Action"].isna().all():
-        st.error("Tidak menemukan kolom 'Created' / tanggal yang bisa dipakai untuk membuat 'Action' pada Ticket Detail.")
+    if missing:
+        st.error("Kolom wajib tidak ditemukan → " + "; ".join(missing))
+        if not tiket_df.empty:
+            st.write("Kolom Tiket tersedia:", list(tiket_df.columns))
+        if not settle_df.empty:
+            st.write("Kolom Settlement tersedia:", list(settle_df.columns))
         st.stop()
 
-    tiket_agg  = aggregate_ticket_by_action(tickets_df, ticket_amt_col)
-    settle_agg = aggregate_settlement_by_date(settle_df, settle_date_col, settle_amt_col)
+    if s_txn_date is None or s_amt is None:
+        st.error("Kolom Settlement wajib tidak ditemukan → Settlement: Transaction Date / Settlement Amount")
+        st.write("Kolom Settlement tersedia:", list(settle_df.columns))
+        st.stop()
+    if s_settle_date is None or s_prod is None:
+        st.warning("Kolom 'Settlement Date' atau 'Product Name' tidak ditemukan. BCA/Non-BCA akan 0.")
 
-    if start_date:
-        tiket_agg  = tiket_agg[tiket_agg["Tanggal"] >= start_date]
-        settle_agg = settle_agg[settle_agg["Tanggal"] >= start_date]
-    if end_date:
-        tiket_agg  = tiket_agg[tiket_agg["Tanggal"] <= end_date]
-        settle_agg = settle_agg[settle_agg["Tanggal"] <= end_date]
+    # --- Tiket Detail: derive Action dari Created + filter paid & espay ---
+    td = tiket_df.copy()
+    td["__action_date"] = _derive_action_from_created(td[t_created], zone)
+    td = td[~td["__action_date"].isna()]
+    td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
+    td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
+    td = td[td_stat_v.eq("paid") & td_bank_v.str.contains("espay")]
+    td = td[(td["__action_date"] >= month_start) & (td["__action_date"] <= month_end)]
+    td[t_amt] = _to_num(td[t_amt])
 
-    hasil = pd.merge(tiket_agg, settle_agg, on="Tanggal", how="outer").sort_values("Tanggal").reset_index(drop=True)
-    for col in ["Tiket Detail ESPAY","Settlement Dana ESPAY"]:
-        if col in hasil:
-            hasil[col] = pd.to_numeric(hasil[col], errors="coerce").fillna(0)
-    hasil["Selisih"] = hasil["Tiket Detail ESPAY"] - hasil["Settlement Dana ESPAY"]
+    tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
+    tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    st.subheader("Hasil Rekonsiliasi per Tanggal")
-    st.dataframe(hasil, use_container_width=True)
+    # --- Settlement Dana ESPAY (Transaction Date) ---
+    sd_txn = settle_df.copy()
+    sd_txn[s_txn_date] = sd_txn[s_txn_date].apply(_to_date)
+    sd_txn = sd_txn[~sd_txn[s_txn_date].isna()]
+    sd_txn = sd_txn[(sd_txn[s_txn_date] >= month_start) & (sd_txn[s_txn_date] <= month_end)]
+    sd_txn[s_amt] = _to_num(sd_txn[s_amt])
+    settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
+    settle_total.index = pd.to_datetime(settle_total.index).date
 
-    with io.BytesIO() as buf:
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            tickets_df.to_excel(writer, sheet_name="All Ticket (raw+action)", index=False)
-            settle_df.to_excel(writer, sheet_name="All Settlement (raw)", index=False)
-            tiket_agg.to_excel(writer, sheet_name="Agg Ticket by Action", index=False)
-            settle_agg.to_excel(writer, sheet_name="Agg Settlement", index=False)
-            hasil.to_excel(writer, sheet_name="Rekonsiliasi per Tgl", index=False)
-        st.download_button("Download Excel Hasil Rekon",
-                           data=buf.getvalue(),
-                           file_name="Rekon_Tiket_vs_Settlement.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # --- Settlement Dana BCA/Non BCA (Settlement Date + Product Name) ---
+    if (s_settle_date is not None) and (s_prod is not None):
+        sd_settle = settle_df.copy()
+        sd_settle[s_settle_date] = sd_settle[s_settle_date].apply(_to_date)
+        sd_settle = sd_settle[~sd_settle[s_settle_date].isna()]
+        sd_settle = sd_settle[(sd_settle[s_settle_date] >= month_start) & (sd_settle[s_settle_date] <= month_end)]
+        sd_settle[s_amt] = _to_num(sd_settle[s_amt])
+
+        target = _norm_label("BCA VA Online")
+        prod_norm = sd_settle[s_prod].apply(_norm_label)
+        bca_mask = prod_norm.eq(target)
+
+        settle_bca    = sd_settle[bca_mask].groupby(sd_settle[bca_mask][s_settle_date])[s_amt].sum() if bca_mask.any() else pd.Series(dtype=float)
+        settle_nonbca = sd_settle[~bca_mask].groupby(sd_settle[~bca_mask][s_settle_date])[s_amt].sum() if (~bca_mask).any() else pd.Series(dtype=float)
+    else:
+        settle_bca = pd.Series(dtype=float)
+        settle_nonbca = pd.Series(dtype=float)
+
+    # --- Reindex ke 1..akhir bulan ---
+    idx = pd.Index(pd.date_range(month_start, month_end, freq="D").date, name="Tanggal")
+
+    def _reidx(s: pd.Series) -> pd.Series:
+        if not isinstance(s, pd.Series):
+            s = pd.Series(dtype=float)
+        if len(getattr(s, "index", [])):
+            s.index = pd.to_datetime(s.index).date
+        return s.reindex(idx, fill_value=0.0)
+
+    tiket_series  = _reidx(tiket_by_date)
+    total_series  = _reidx(settle_total)
+    bca_series    = _reidx(settle_bca)
+    nonbca_series = _reidx(settle_nonbca)
+
+    # --- Tabel utama ---
+    final = pd.DataFrame(index=idx)
+    final["Tiket Detail ESPAY"]      = tiket_series.values
+    final["Settlement Dana ESPAY"]   = total_series.values
+    final["Selisih"]                 = final["Tiket Detail ESPAY"] - final["Settlement Dana ESPAY"]
+    final["Settlement Dana BCA"]     = bca_series.values
+    final["Settlement Dana Non BCA"] = nonbca_series.values
+
+    view = final.reset_index()
+    view.insert(0, "No", range(1, len(view) + 1))
+    total_row = pd.DataFrame([{
+        "No": "",
+        "Tanggal": "TOTAL",
+        "Tiket Detail ESPAY": final["Tiket Detail ESPAY"].sum(),
+        "Settlement Dana ESPAY": final["Settlement Dana ESPAY"].sum(),
+        "Selisih": final["Selisih"].sum(),
+        "Settlement Dana BCA": final["Settlement Dana BCA"].sum(),
+        "Settlement Dana Non BCA": final["Settlement Dana Non BCA"].sum(),
+    }])
+    view_total = pd.concat([view, total_row], ignore_index=True)
+
+    fmt = view_total.copy()
+    for c in ["Tiket Detail ESPAY", "Settlement Dana ESPAY", "Selisih", "Settlement Dana BCA", "Settlement Dana Non BCA"]:
+        fmt[c] = fmt[c].apply(_idr_fmt)
+
+    st.subheader("Hasil Rekonsiliasi per Tanggal (mengikuti bulan parameter)")
+    st.dataframe(fmt, use_container_width=True, hide_index=True)
+
+    # Unduh Excel
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        view_total.to_excel(xw, index=False, sheet_name="Rekonsiliasi")
+        fmt.to_excel(xw, index=False, sheet_name="Rekonsiliasi_View")
+    st.download_button(
+        "Unduh Excel",
+        data=out.getvalue(),
+        file_name=f"rekonsiliasi_{y}-{m:02d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
