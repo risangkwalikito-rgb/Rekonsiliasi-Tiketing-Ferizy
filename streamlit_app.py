@@ -8,6 +8,12 @@ Percepatan:
 - CSV cepat: sniff delimiter -> engine='c'
 - Parser tanggal & Created->Action vektor (tanpa apply)
 - Dukungan ZIP (.csv/.xls/.xlsx)
+
+Tambahan:
+- Parameter Zona Waktu (WIB/WITA/WIT) untuk koreksi tanggal berdasarkan kolom Created:
+  * WIB  : tanpa perubahan
+  * WITA : Created jam 00:00–00:59 dimundurkan 1 hari
+  * WIT  : Created jam 00:00–01:59 dimundurkan 1 hari
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from typing import Optional, List, Tuple, Iterable
 import numpy as np
 import pandas as pd
 import streamlit as st
-from dateutil import parser as dtparser
+from dateutil import parser as dtparser  # (masih dipertahankan jika dibutuhkan di tempat lain)
 
 # ---------------------- Fast helpers ----------------------
 
@@ -57,16 +63,13 @@ def _parse_money(val) -> float:
     return -num if neg else num
 
 def to_num_series(s: pd.Series) -> pd.Series:
-    # cukup robust + cepat (masih apply, tapi setelah cleaning vector)
     if s.dtype != object:
         return s.astype(float, errors='ignore')
     return s.apply(_parse_money).astype(float)
 
 def fast_to_date_series(sr: pd.Series) -> pd.Series:
     """Parse vektor: coba pandas langsung; jika NaT & numerik -> serial Excel."""
-    # langkah 1: pandas langsung
     s = pd.to_datetime(sr, errors="coerce", dayfirst=True)
-    # langkah 2: serial Excel untuk numerik yang masih NaT
     if isinstance(sr, pd.Series):
         nums = pd.to_numeric(sr, errors="coerce")
         mask = s.isna() & nums.notna()
@@ -75,11 +78,10 @@ def fast_to_date_series(sr: pd.Series) -> pd.Series:
     return s.dt.normalize()
 
 def derive_action_fixed_fast(created_sr: pd.Series) -> pd.Series:
-    """Ambil 10 char pertama 'YYYY-MM-DD'. Fallback: fast_to_date_series."""
+    """(Versi lama) Ambil 10 char pertama 'YYYY-MM-DD'. Fallback: fast_to_date_series."""
     as_str = created_sr.astype(str, copy=False).str.slice(0, 10)
     mask_iso = as_str.str.match(r"\d{4}-\d{2}-\d{2}")
     out = pd.to_datetime(as_str.where(mask_iso), errors="coerce")
-    # fallback untuk baris yang gagal
     miss = out.isna()
     if miss.any():
         out.loc[miss] = fast_to_date_series(created_sr[miss])
@@ -118,6 +120,63 @@ def month_selector() -> Tuple[int, int]:
     with c1: year = st.selectbox("Tahun", years, index=years.index(today.year))
     with c2: sel = st.selectbox("Bulan", months, index=int(today.strftime("%m"))-1, format_func=lambda x: x[1]); month = int(sel[0])
     return year, month
+
+# ---------------------- Zona Waktu helpers ----------------------
+
+def _fast_to_datetime_with_flags(sr: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """
+    Parse ke datetime (mempertahankan jam-menit-detik bila ada).
+    Mengembalikan:
+      - dt: Series datetime64[ns]
+      - has_time: Series bool; True bila input mengandung waktu (teks dengan ':'
+                  atau serial Excel dengan pecahan hari != 0).
+    """
+    # Deteksi ada jam dari teks
+    s_text = sr.astype(str, copy=False)
+    has_time_text = s_text.str.contains(r"\d{1,2}:\d{2}", regex=True, na=False)
+
+    # Parse cepat
+    dt = pd.to_datetime(sr, errors="coerce", dayfirst=True)
+
+    # Fallback numerik (serial Excel, termasuk fraksi -> waktu)
+    nums = pd.to_numeric(sr, errors="coerce")
+    need_num = dt.isna() & nums.notna()
+    if need_num.any():
+        dt.loc[need_num] = pd.to_datetime(nums[need_num], unit="D", origin="1899-12-30", errors="coerce")
+    has_time_num = nums.notna() & (np.abs(nums - np.floor(nums)) > 1e-12)
+
+    # Fallback terakhir: first 10 chars (tanggal saja, dianggap tanpa jam)
+    still_nat = dt.isna()
+    if still_nat.any():
+        first10 = pd.to_datetime(s_text[still_nat].str.slice(0, 10), errors="coerce")
+        dt.loc[still_nat] = first10
+
+    has_time = has_time_text | has_time_num
+    has_time = has_time & dt.notna()  # hanya valid jika datetime berhasil
+    return dt, has_time
+
+def derive_action_with_timezone(created_sr: pd.Series, zona: str) -> pd.Series:
+    """
+    Hitung tanggal aksi dari kolom Created + aturan zona waktu:
+      - WIB : tidak ada perubahan
+      - WITA: jika jam 00:00–00:59 => mundur 1 hari
+      - WIT : jika jam 00:00–01:59 => mundur 1 hari
+    HANYA menggeser bila input memang memiliki informasi waktu (has_time=True).
+    Output: tanggal (normalize).
+    """
+    dt, has_time = _fast_to_datetime_with_flags(created_sr)
+    adj = dt.copy()
+
+    if zona == "WITA":
+        mask = has_time & adj.notna() & (adj.dt.hour == 0)
+        adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
+    elif zona == "WIT":
+        mask = has_time & adj.notna() & (adj.dt.hour.isin([0, 1]))
+        adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
+    else:  # WIB / default
+        pass
+
+    return adj.dt.normalize()
 
 # ---------------------- Readers (cached + parallel) ----------------------
 
@@ -250,6 +309,15 @@ with st.sidebar:
     month_end   = pd.Timestamp(y, m, calendar.monthrange(y, m)[1])
     st.caption(f"Periode: {month_start.date()} s/d {month_end.date()}")
 
+    # --- NEW: Zona Waktu
+    zona_waktu = st.selectbox(
+        "Zona Waktu",
+        options=["WIB", "WITA", "WIT"],
+        index=0,
+        help="WIB: tanpa perubahan • WITA: 00:00–00:59 mundur 1 hari • WIT: 00:00–01:59 mundur 1 hari",
+        key="__zona_waktu__",
+    )
+
     go = st.button("Proses", type="primary", use_container_width=True)
 
 # baca (cached + paralel)
@@ -309,9 +377,12 @@ if go:
     if s_settle_date is None or s_prod is None:
         st.warning("Kolom 'Settlement Date' / 'Product Name' tidak ditemukan. Kolom BCA/Non-BCA akan 0.")
 
-    # ---------- Tiket (Action dari Created: fixed 10, vektor) ----------
+    # ---------- Tiket (Action dari Created + ZONA WAKTU) ----------
     td = tiket_df[[t_created, t_amt, t_stat, t_bank]].copy()
-    td["__action_date"] = derive_action_fixed_fast(td[t_created])
+
+    # (NEW) gunakan aturan zona waktu untuk menghasilkan tanggal aksi
+    td["__action_date"] = derive_action_with_timezone(td[t_created], zona_waktu)
+
     td = td[td["__action_date"].notna()]
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
     td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
