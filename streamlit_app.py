@@ -121,7 +121,7 @@ def build_daily_table(df_month, year_sel, month_sel):
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
         "IFCS": h.eq("cash"),
-        "Redeem": h.eq("redeem"),
+        "Redeem": h.eq("reedem"),
         "ESPAY": (h.eq("finpay") & aa.str.contains("esp", na=False)),
         "FINNET": (h.eq("finpay") & ~aa.str.contains("esp", na=False)),
     }
