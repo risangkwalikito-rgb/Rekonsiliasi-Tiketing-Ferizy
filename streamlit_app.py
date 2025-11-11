@@ -6,9 +6,9 @@ import pandas as pd, numpy as np, streamlit as st
 st.set_page_config(page_title="Rekon Ferizy - Tabel Utama", layout="wide")
 st.title("Detail Tiket from Payment Report Ferizy — Tabel Utama")
 st.caption(
-    "Versi ringan: hanya menampilkan Tabel Harian (1–28/29/30/31) + Sub Total. "
+    "Hanya Tabel Harian (1–28/29/30/31) + Sub Total. "
     "Baca kolom B (Tanggal), H (Kanal), K (Nominal), AA (Deskripsi), Q (Pelabuhan). "
-    "Angka ditampilkan dengan format Indonesia (titik ribuan)."
+    "Deteksi ESPAY/FINNET/REDEEM diperluas agar tidak tercampur. Angka tampil dengan titik ribuan."
 )
 
 # =========================
@@ -108,25 +108,34 @@ def build_daily_table(df_month, year_sel, month_sel):
         res["Total"] = 0.0
         return res
 
-    h = normalize_str_series(df_month["H"])
-    aa = normalize_str_series(df_month["AA"]) if "AA" in df_month.columns else pd.Series([None]*len(df_month))
+    h  = normalize_str_series(df_month["H"])
+    aa = normalize_str_series(df_month["AA"]) if "AA" in df_month.columns else pd.Series([""]*len(df_month))
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    mask = {
+    # ====== DETEKSI YANG LEBIH ROBUST ======
+    # Finpay/ESP/ESPAY/Finnet bisa muncul di H atau AA; kita gabungkan aturan & hindari tabrakan.
+    mask_finpay     = h.str.contains("finpay", na=False)
+    mask_esp_token  = aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False) \
+                      | h.str.contains("espay", na=False) | h.str.contains(r"\besp\b", na=False)
+    espay_mask      = mask_esp_token | (mask_finpay & (aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))
+    finnet_mask     = (h.str.contains("finnet", na=False) | (mask_finpay & ~(aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))) & ~espay_mask
+    redeem_mask     = h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
+
+    masks = {
         "Cash": h.eq("cash"),
         "Prepaid - BRI": h.eq("prepaid-bri"),
         "Prepaid - Mandiri": h.eq("prepaid-mandiri"),
         "Prepaid - BNI": h.eq("prepaid-bni"),
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
-        "IFCS": h.eq("cash"),
-        "Redeem": h.eq("reedem"),
-        "ESPAY": (h.eq("finpay") & aa.str.contains("esp", na=False)),
-        "FINNET": (h.eq("finpay") & ~aa.str.contains("esp", na=False)),
+        "IFCS": h.eq("cash"),     # IFCS = Cash
+        "Redeem": reedem_mask,
+        "ESPAY": espay_mask,
+        "FINNET": finnet_mask,
     }
 
-    for key, m in mask.items():
+    for key, m in masks.items():
         s = pd.Series(np.where(m, amt, 0.0)).groupby(tgl).sum()
         res[key] = s.reindex(all_days, fill_value=0.0).values
 
@@ -165,14 +174,12 @@ with st.sidebar:
     month_sel = bulan_id.index(month_sel_name)+1
 
 # =========================
-# Main: TAMPILKAN HANYA TABEL UTAMA
+# Main: TABEL UTAMA SAJA
 # =========================
 if not upl:
-    st.info("Silakan upload file di sidebar untuk memulai.")
-    st.stop()
+    st.info("Silakan upload file di sidebar untuk memulai."); st.stop()
 if df is None or df.empty:
-    st.error("Tidak ada data yang terbaca.")
-    st.stop()
+    st.error("Tidak ada data yang terbaca."); st.stop()
 
 st.write(":small_blue_diamond: Baris data terunggah:", len(df))
 
