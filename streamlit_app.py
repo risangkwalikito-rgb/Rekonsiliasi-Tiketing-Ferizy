@@ -1,4 +1,4 @@
-# app.py — Hanya Tabel Utama, ESPAY=H=='finpay' & AA startswith 'esp'
+# app.py — Hanya Tabel Utama, ESPAY = H=='finpay' & AA diawali 'esp' (boleh ada tanda - _ . ' " / \ di depan)
 import io, zipfile, calendar
 from datetime import date
 import pandas as pd, numpy as np, streamlit as st
@@ -55,7 +55,7 @@ def _read_csv_subset(b: bytes) -> pd.DataFrame:
         except Exception:
             bio.seek(0)
             df = pd.read_csv(bio, low_memory=False)
-            if df.shape[1] >= 27:
+            if df.shape[1] >= 27:  # potong jika kolom cukup
                 df = df.iloc[:, CSV_USECOLS]
     df.columns = COL_LETTERS[:df.shape[1]]
     for c in COL_LETTERS:
@@ -111,13 +111,15 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    # ===== Aturan kanal (ESPAY berawalan 'esp')
-    mask_h_finpay   = h.eq("finpay")                     # persis 'finpay'
-    mask_aa_esphead = aa.str.match(r"^\s*esp", na=False) # mulai dengan 'esp' (abaikan spasi awal)
+    # ===== Aturan kanal (ESPAY berawalan 'esp' setelah tanda pembuka opsional)
+    mask_h_finpay   = h.eq("finpay")  # persis 'finpay'
+    # izinkan spasi/tanda [' " . - _ / \ ] di awal sebelum 'esp'
+    mask_aa_esphead = aa.str.match(r"^\s*['\".\-_/\\]*esp", na=False)
 
     espay_mask  = mask_h_finpay & mask_aa_esphead
     finnet_mask = mask_h_finpay & ~mask_aa_esphead
 
+    # Reedem: ejaan reedem/redeem, hasil tetap ke kolom "Reedem"
     reedem_mask = (
         h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False) |
         h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
