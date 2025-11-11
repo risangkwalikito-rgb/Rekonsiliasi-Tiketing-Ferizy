@@ -6,7 +6,6 @@ from datetime import date
 import pandas as pd
 import numpy as np
 import streamlit as st
-import traceback
 
 st.set_page_config(page_title="Tabel Rekon Otomatis - Ferizy", layout="wide")
 st.title("Detail Tiket from Payment Report Ferizy")
@@ -47,8 +46,8 @@ def format_id_number(v, decimals: int = 0):
         n = float(v)
     except Exception:
         return v
-    s = f"{n:,.{decimals}f}"              # 1,234,567.89
-    return s.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.234.567,89
+    s = f"{n:,.{decimals}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def df_format_id(df: pd.DataFrame, cols, decimals: int = 0) -> pd.DataFrame:
     disp = df.copy()
@@ -197,6 +196,20 @@ def build_daily_table(df_month, year_sel, month_sel, h_col, aa_col, amount_col, 
     result["Total"] = result[CHANNEL_COLS].sum(axis=1)
     return result
 
+def build_daily_total_only(df_month, year_sel, month_sel, amount_col, date_col='Tanggal'):
+    """Cepat: hanya Tanggal & Total (tanpa pecahan kanal)."""
+    last_day = calendar.monthrange(year_sel, month_sel)[1]
+    all_days = pd.date_range(f"{year_sel}-{month_sel:02d}-01", periods=last_day, freq='D').date
+    result = pd.DataFrame({"Tanggal": all_days})
+    if df_month.empty:
+        result["Total"] = 0.0
+        return result
+    amt = pd.to_numeric(df_month[amount_col], errors='coerce').fillna(0.0)
+    tgl = pd.to_datetime(df_month[date_col], errors='coerce').dt.date
+    s = pd.Series(amt).groupby(tgl).sum()
+    result["Total"] = s.reindex(all_days, fill_value=0.0).values
+    return result
+
 def filter_port(df, q_col, port_name):
     q_vals = normalize_str_series(df[q_col])
     return df[q_vals.eq(port_name.strip().lower())]
@@ -266,13 +279,13 @@ with st.sidebar:
             years = [today.year]
             default_year = today.year
             default_month = today.month
-    except Exception as e:
+    except Exception:
         today = date.today()
         years = [today.year]
         default_year = today.year
         default_month = today.month
         if error_detail:
-            st.warning("Gagal mendeteksi rentang tanggal dari data; memakai tahun/bulan saat ini.")
+            st.warning("Gagal mendeteksi rentang tanggal; memakai tahun/bulan saat ini.")
 
     bulan_id = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
     year_sel = st.selectbox("Tahun", years, index=min(years.index(default_year), len(years)-1))
@@ -293,7 +306,7 @@ try:
 
     st.write(":small_blue_diamond: Baris data terunggah:", len(df))
 
-    # Pemetaan kolom (tanpa menampilkan expander)
+    # Pemetaan kolom (diam—tanpa tampil expander)
     h_col, _ = resolve_column(df, 'H', 7)
     k_col, _ = resolve_column(df, 'K', 10)
     aa_col, _ = resolve_column(df, 'AA', 26)
@@ -321,7 +334,7 @@ try:
     else:
         df_month = df.iloc[0:0].copy()
 
-    # ===== Tabel Harian + Sub Total =====
+    # ===== Tabel Harian (All Ports) + Sub Total =====
     st.subheader(f"Tabel Harian — {bulan_id[month_sel-1]} {year_sel} (sum kolom K) + Total + Sub Total")
     daily_table = build_daily_table(
         df_month=df_month,
@@ -333,8 +346,7 @@ try:
         [daily_table, pd.DataFrame([{"Tanggal": "Sub Total", **subtotal_vals.to_dict()}])],
         ignore_index=True
     )
-    daily_display = df_format_id(daily_with_sub, cols=CHANNEL_COLS + ["Total"], decimals=0)
-    st.dataframe(daily_display, use_container_width=True)
+    st.dataframe(df_format_id(daily_with_sub, cols=CHANNEL_COLS + ["Total"], decimals=0), use_container_width=True)
     st.download_button(
         "Unduh Tabel Harian (CSV)",
         daily_with_sub.to_csv(index=False).encode("utf-8"),
@@ -345,8 +357,7 @@ try:
     # ===== Rekap Bulanan (Semua Pelabuhan) + Total =====
     st.subheader("Rekap Bulanan — Semua Pelabuhan (sum kolom K) + Total")
     main_metrics_month = build_metrics(df_month, h_col=h_col, aa_col=aa_col, amount_col=k_col)
-    main_display = df_format_id(main_metrics_month, cols=CHANNEL_COLS + ["Total"], decimals=0)
-    st.dataframe(main_display, use_container_width=True)
+    st.dataframe(df_format_id(main_metrics_month, cols=CHANNEL_COLS + ["Total"], decimals=0), use_container_width=True)
     st.download_button(
         "Unduh Rekap Bulanan (CSV)",
         main_metrics_month.to_csv(index=False).encode('utf-8'),
@@ -354,25 +365,57 @@ try:
         mime="text/csv"
     )
 
-    # ===== Per Pelabuhan =====
+    # ===== Per Pelabuhan: tampilkan PER TANGGAL =====
     if q_col is not None and not df_month.empty:
-        st.subheader("Tabel Per Pelabuhan (bulan terpilih) + Total")
+        st.subheader("Tabel Per Pelabuhan (bulan terpilih) — Per Tanggal")
         tabs = st.tabs(["Merak", "Bakauheni", "Ketapang"])
         for tab, port in zip(tabs, ["merak", "bakauheni", "ketapang"]):
             with tab:
                 port_df = filter_port(df_month, q_col, port)
-                met = build_metrics(port_df, h_col=h_col, aa_col=aa_col, amount_col=k_col)
-                met_display = df_format_id(met, cols=CHANNEL_COLS + ["Total"], decimals=0)
-                st.caption(f"Total baris {port.title()} (bulan ini): {len(port_df)}")
-                st.dataframe(met_display, use_container_width=True)
+
+                # 1) Cepat: Tanggal & Total saja
+                daily_total = build_daily_total_only(
+                    df_month=port_df,
+                    year_sel=year_sel, month_sel=month_sel,
+                    amount_col=k_col, date_col='Tanggal'
+                )
+                st.markdown(f"**Total Harian {port.title()}**")
+                st.dataframe(df_format_id(daily_total, cols=["Total"], decimals=0), use_container_width=True)
                 st.download_button(
-                    f"Unduh Rekon {port.title()} (CSV)",
+                    f"Unduh Total Harian {port.title()} (CSV)",
+                    daily_total.to_csv(index=False).encode('utf-8'),
+                    file_name=f"rekon_{port}_total_harian_{year_sel}_{month_sel:02d}.csv",
+                    mime="text/csv"
+                )
+
+                # 2) Opsional (lebih detail): per kanal per tanggal
+                show_detail = st.checkbox(f"Tampilkan rincian kanal {port.title()} (lebih berat)", value=False, key=f"detail_{port}")
+                if show_detail:
+                    daily_port_detail = build_daily_table(
+                        df_month=port_df,
+                        year_sel=year_sel, month_sel=month_sel,
+                        h_col=h_col, aa_col=aa_col, amount_col=k_col, date_col='Tanggal'
+                    )
+                    st.dataframe(df_format_id(daily_port_detail, cols=CHANNEL_COLS + ["Total"], decimals=0), use_container_width=True)
+                    st.download_button(
+                        f"Unduh Harian (dengan kanal) {port.title()} (CSV)",
+                        daily_port_detail.to_csv(index=False).encode('utf-8'),
+                        file_name=f"rekon_{port}_harian_kanal_{year_sel}_{month_sel:02d}.csv",
+                        mime="text/csv"
+                    )
+
+                # 3) Rekap bulanan per kanal (tetap ada)
+                met = build_metrics(port_df, h_col=h_col, aa_col=aa_col, amount_col=k_col)
+                st.markdown(f"**Rekap Bulanan per Kanal — {port.title()}**")
+                st.dataframe(df_format_id(met, cols=CHANNEL_COLS + ["Total"], decimals=0), use_container_width=True)
+                st.download_button(
+                    f"Unduh Rekap Bulanan {port.title()} (CSV)",
                     met.to_csv(index=False).encode('utf-8'),
                     file_name=f"rekon_ferizy_{port}_{year_sel}_{month_sel:02d}.csv",
                     mime="text/csv"
                 )
 
-    st.success("Selesai. Bagian pemetaan & preview disembunyikan untuk mempercepat proses.")
+    st.success("Selesai. Seksi Per Pelabuhan kini menampilkan data per tanggal (Total), dan rincian per kanal bisa ditampilkan bila diperlukan.")
 except Exception as e:
     st.error("Terjadi error saat menjalankan aplikasi.")
     if error_detail:
