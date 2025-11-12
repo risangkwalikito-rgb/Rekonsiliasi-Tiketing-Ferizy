@@ -1,194 +1,247 @@
-# app.py — Hanya Tabel Utama, ESPAY = H=='finpay' & AA diawali 'ESP' (huruf besar)
-import io, zipfile, calendar
-from datetime import date
-import pandas as pd, numpy as np, streamlit as st
+# requirements.txt
+streamlit>=1.33
+pandas>=2.2
+openpyxl>=3.1
+xlsxwriter>=3.1
 
-st.set_page_config(page_title="Rekon Ferizy", layout="wide")
+# app.py
+# path: ./app.py
+import io
+from collections import OrderedDict
+from typing import List, Optional
 
-# =========================
-# Konstanta & Util
-# =========================
-CHANNEL_COLS = [
-    "Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA",
-    "SKPT","IFCS","Reedem","ESPAY","FINNET"
-]
-COL_LETTERS = ["B","H","K","AA","Q"]        # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
-CSV_USECOLS = [1,7,10,26,16]                # posisi 0-based utk B,H,K,AA,Q
+import pandas as pd
+import streamlit as st
 
-def normalize_str_series(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.lower()
 
-def format_id_number(v, decimals=0):
-    if pd.isna(v): return ""
-    try: n = float(v)
-    except: return v
-    s = f"{n:,.{decimals}f}"
-    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+def _default_by_position(cols: List[str], pos: int) -> Optional[str]:
+    """Return default column name by Excel-like position (0-based)."""
+    return cols[pos] if len(cols) > pos else None
 
-def df_format_id(df, cols, decimals=0):
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = out[c].apply(lambda x: format_id_number(x, decimals))
-    return out
 
-# =========================
-# Reader hemat RAM (ambil hanya B,H,K,AA,Q)
-# =========================
-def _read_excel_subset(b: bytes) -> pd.DataFrame:
-    bio = io.BytesIO(b)
-    df = pd.read_excel(bio, usecols="B,H,K,AA,Q", dtype=object, engine=None)
-    df.columns = COL_LETTERS[:df.shape[1]]
-    for c in COL_LETTERS:
-        if c not in df.columns: df[c] = np.nan
-    return df[COL_LETTERS]
+def _contains_token(series: pd.Series, token: str) -> pd.Series:
+    token = (token or "").lower()
+    return series.fillna("").astype(str).str.lower().str.contains(token, na=False)
 
-def _read_csv_subset(b: bytes) -> pd.DataFrame:
-    bio = io.BytesIO(b)
-    try:
-        import pyarrow  # optional
-        df = pd.read_csv(bio, engine="pyarrow", usecols=CSV_USECOLS)
-    except Exception:
-        bio.seek(0)
-        try:
-            df = pd.read_csv(bio, engine="python", on_bad_lines="skip", low_memory=False, usecols=CSV_USECOLS)
-        except Exception:
-            bio.seek(0)
-            df = pd.read_csv(bio, low_memory=False)
-            if df.shape[1] >= 27:
-                df = df.iloc[:, CSV_USECOLS]
-    df.columns = COL_LETTERS[:df.shape[1]]
-    for c in COL_LETTERS:
-        if c not in df.columns: df[c] = np.nan
-    return df[COL_LETTERS]
 
-@st.cache_data(show_spinner=False)
-def read_single(uploaded_name: str, b: bytes):
-    name = uploaded_name.lower()
-    if name.endswith((".xlsx",".xls")):
-        return _read_excel_subset(b)
-    elif name.endswith(".csv"):
-        return _read_csv_subset(b)
+def _startswith_token(series: pd.Series, prefix: str) -> pd.Series:
+    prefix = (prefix or "").lower()
+    return series.fillna("").astype(str).str.lower().str.startswith(prefix)
+
+
+CATEGORY_RULES = OrderedDict(
+    [
+        ("Cash", lambda H, AA: _contains_token(H, "cash")),
+        ("Prepaid BRI", lambda H, AA: _contains_token(H, "prepaid-bri")),
+        ("Prepaid BNI", lambda H, AA: _contains_token(H, "prepaid-bni")),
+        ("Prepaid Mandiri", lambda H, AA: _contains_token(H, "prepaid-mandiri")),
+        ("Prepaid BCA", lambda H, AA: _contains_token(H, "prepaid-bca")),
+        ("SKPT", lambda H, AA: _contains_token(H, "skpt")),
+        ("IFCS", lambda H, AA: _contains_token(H, "ifcs")),
+        ("Reedem", lambda H, AA: _contains_token(H, "reedem")),
+        ("ESPAY", lambda H, AA: _contains_token(H, "finpay") & _startswith_token(AA, "esp")),
+        ("Finnet", lambda H, AA: _contains_token(H, "finpay") & (~_startswith_token(AA, "esp"))),
+    ]
+)
+
+
+def reconcile(
+    df: pd.DataFrame,
+    col_h: str,
+    col_aa: Optional[str],
+    amount_col: str,
+    group_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Rekonsiliasi berdasarkan aturan kategori. Mengembalikan DataFrame kategori + Total."""
+    if col_h not in df.columns:
+        raise ValueError(f"Kolom H tidak ditemukan: {col_h}")
+    if col_aa and col_aa not in df.columns:
+        raise ValueError(f"Kolom AA tidak ditemukan: {col_aa}")
+    if amount_col not in df.columns:
+        raise ValueError(f"Kolom nominal tidak ditemukan: {amount_col}")
+
+    H = df[col_h]
+    AA = df[col_aa] if col_aa else pd.Series([""] * len(df), index=df.index)
+    amount = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
+
+    pieces = {}
+    if group_cols:
+        for name, rule in CATEGORY_RULES.items():
+            mask = rule(H, AA)
+            grp = df.loc[mask, group_cols].copy()
+            grp["_amt"] = amount.loc[mask].values
+            pieces[name] = grp.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
+        result = pd.concat(pieces, axis=1).fillna(0)
     else:
-        return pd.DataFrame(columns=COL_LETTERS)
+        idx = pd.Index(["TOTAL"])
+        for name, rule in CATEGORY_RULES.items():
+            mask = rule(H, AA)
+            pieces[name] = pd.Series([amount.loc[mask].sum()], index=idx)
+        result = pd.concat(pieces, axis=1).fillna(0)
 
-@st.cache_data(show_spinner=False)
-def read_zip(archive_bytes: bytes):
-    zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    frames = []
-    for info in zf.infolist():
-        if info.is_dir(): continue
-        content = zf.read(info)
-        low = info.filename.lower()
-        try:
-            if low.endswith(".csv"):
-                frames.append(_read_csv_subset(content))
-            elif low.endswith((".xlsx",".xls")):
-                frames.append(_read_excel_subset(content))
-        except Exception:
-            pass
-    if frames:
-        df = pd.concat(frames, ignore_index=True, sort=False)
-        return df[COL_LETTERS]
-    return pd.DataFrame(columns=COL_LETTERS)
+    result["Total"] = result.sum(axis=1)
+    return result
 
-# =========================
-# Agregasi: Tabel Utama (harian semua pelabuhan)
-# =========================
-def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> pd.DataFrame:
-    """Output: Tanggal + tiap kanal (sum K) + Total."""
-    last_day = calendar.monthrange(year_sel, month_sel)[1]
-    all_days = pd.date_range(f"{year_sel}-{month_sel:02d}-01", periods=last_day, freq="D").date
-    res = pd.DataFrame({"Tanggal": all_days})
 
-    if df_month.empty:
-        for c in CHANNEL_COLS: res[c] = 0.0
-        res["Total"] = 0.0
-        return res
+def main() -> None:
+    st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
+    st.title("Rekonsiliasi Payment Report (Excel → Streamlit)")
+    st.caption("Upload Excel, parse Tanggal dari kolom B (tanpa jam), amount dari kolom K, lalu rekonsiliasi kategori.")
 
-    # H tetap distandardkan ke huruf kecil (karena 'finpay' biasanya kecil)
-    h  = normalize_str_series(df_month["H"]).fillna("")
+    uploaded = st.file_uploader("Upload file Excel (.xlsx/.xls). CSV juga didukung.", type=["xlsx", "xls", "csv"])
+    if not uploaded:
+        st.info("Silakan upload file untuk mulai.")
+        return
 
-    # **AA tidak di-lowercase** agar "ESP" besar bisa dideteksi persis di awal
-    aa_raw = df_month["AA"].astype(str).fillna("")
+    # Load data
+    if uploaded.name.lower().endswith((".xlsx", ".xls")):
+        xls = pd.ExcelFile(uploaded)
+        sheet = st.sidebar.selectbox("Pilih sheet", xls.sheet_names, index=0)
+        df = xls.parse(sheet)
+    else:
+        df = pd.read_csv(uploaded)
 
-    amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
-    tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
+    if df.empty:
+        st.warning("Data kosong.")
+        return
 
-    # ===== Aturan kanal =====
-    # ESPAY: H == 'finpay' & AA DIAWALI 'ESP' (boleh ada spasi/tanda pemisah ringan sebelum ESP)
-    mask_h_finpay   = h.eq("finpay")
-    mask_aa_ESPhead = aa_raw.str.match(r"^\s*['\".\-_/\\()\[\]–—]*ESP", na=False)
+    cols = list(df.columns)
 
-    espay_mask  = mask_h_finpay & mask_aa_ESPhead
-    finnet_mask = mask_h_finpay & ~mask_aa_ESPhead
+    # Default posisi Excel: B=1 (0-based), H=7, K=10, AA=26
+    default_b = _default_by_position(cols, 1)
+    default_h = _default_by_position(cols, 7)
+    default_k = _default_by_position(cols, 10)
+    default_aa = _default_by_position(cols, 26)
 
-    # Reedem: tangkap 'reedem'/'redeem' (case-insensitive), output ke kolom "Reedem"
-    aa_low = aa_raw.str.lower()
-    reedem_mask = (
-        h.str.contains("reedem", na=False) | aa_low.str.contains("reedem", na=False) |
-        h.str.contains("redeem", na=False) | aa_low.str.contains("redeem", na=False)
+    st.sidebar.subheader("Pengaturan Kolom")
+    # Kolom tanggal (B)
+    try:
+        idx_b = cols.index(default_b) if default_b in cols else 0
+    except Exception:
+        idx_b = 0
+    col_b = st.sidebar.selectbox("Pilih kolom B (Tanggal, berisi tanggal+jam)", cols, index=idx_b)
+
+    # Parse tanggal (abaikan jam) dan letakkan di kiri
+    tanggal_series = pd.to_datetime(df[col_b], errors="coerce")
+    # Kenapa: user minta abaikan jam → hanya tanggal
+    tanggal_series = tanggal_series.dt.date
+    df.insert(0, "Tanggal", tanggal_series)
+
+    # Kolom H (kategori)
+    try:
+        idx_h = list(df.columns).index(default_h) if default_h in df.columns else 1
+    except Exception:
+        idx_h = 1
+    col_h = st.sidebar.selectbox("Pilih kolom H (kategori)", list(df.columns), index=idx_h)
+
+    # Kolom AA (opsional)
+    aa_options = ["<tanpa kolom AA>"] + list(df.columns)
+    idx_aa = 0
+    if default_aa in df.columns:
+        idx_aa = aa_options.index(default_aa)
+    sel_aa = st.sidebar.selectbox("Pilih kolom AA (referensi)", aa_options, index=idx_aa)
+    col_aa = None if sel_aa == "<tanpa kolom AA>" else sel_aa
+
+    # Kolom K (amount)
+    try:
+        idx_k = list(df.columns).index(default_k) if default_k in df.columns else 1
+    except Exception:
+        idx_k = 1
+    amount_col = st.sidebar.selectbox(
+        "Pilih kolom K (Amount)", list(df.columns), index=idx_k,
+        help="Sesuai permintaan: amount diambil dari kolom K secara default."
     )
 
-    masks = {
-        "Cash": h.eq("cash"),
-        "Prepaid - BRI": h.eq("prepaid-bri"),
-        "Prepaid - Mandiri": h.eq("prepaid-mandiri"),
-        "Prepaid - BNI": h.eq("prepaid-bni"),
-        "Prepaid - BCA": h.eq("prepaid-bca"),
-        "SKPT": h.eq("skpt"),
-        "IFCS": h.eq("cash"),
-        "Reedem": reedem_mask,
-        "ESPAY":  espay_mask,   # H='finpay' & AA startswith 'ESP'
-        "FINNET": finnet_mask,  # H='finpay' & AA not startswith 'ESP'
-    }
+    # Group by: default per Tanggal
+    selectable_group_cols = [c for c in df.columns if c not in {amount_col}]
+    default_groups = ["Tanggal"] if "Tanggal" in selectable_group_cols else []
+    group_cols = st.sidebar.multiselect(
+        "Group By (default per Tanggal)",
+        options=selectable_group_cols,
+        default=default_groups,
+    )
 
-    for key, m in masks.items():
-        s = pd.Series(np.where(m, amt, 0.0)).groupby(tgl).sum()
-        res[key] = s.reindex(all_days, fill_value=0.0).values
+    st.subheader("Preview Data (setelah tambah kolom Tanggal)")
+    st.dataframe(df.head(20), use_container_width=True)
 
-    res["Total"] = res[CHANNEL_COLS].sum(axis=1)
-    return res
+    with st.spinner("Menghitung rekonsiliasi..."):
+        try:
+            result = reconcile(
+                df,
+                col_h=col_h,
+                col_aa=col_aa,
+                amount_col=amount_col,  # Kenapa: user minta join amount dari K
+                group_cols=group_cols or None,
+            )
+        except Exception as e:
+            st.error(f"Gagal merekonsiliasi: {e}")
+            return
 
-# =========================
-# Sidebar: Upload & Periode (minimal)
-# =========================
-df = None
-with st.sidebar:
-    upl = st.file_uploader("Upload Excel/CSV/ZIP (kolom B,H,K,AA,Q saja)", type=["xlsx","xls","csv","zip"])
-    if upl:
-        by = upl.getvalue()
-        df = read_zip(by) if upl.name.lower().endswith(".zip") else read_single(upl.name, by)
+    # Tampilkan hasil dengan Tanggal di paling kiri bila ada
+    st.subheader("Hasil Rekonsiliasi")
+    result_display = result.reset_index()
+    if "Tanggal" in result_display.columns:
+        # Pastikan Tanggal kolom paling kiri
+        other_cols = [c for c in result_display.columns if c != "Tanggal"]
+        result_display = result_display[["Tanggal"] + other_cols]
+    st.dataframe(result_display, use_container_width=True)
 
-    today = date.today()
-    if upl and df is not None and not df.empty and df["B"].notna().any():
-        dmin = pd.to_datetime(df["B"], errors="coerce").min()
-        dmax = pd.to_datetime(df["B"], errors="coerce").max()
-        years = list(range(int((dmin or today).year), int((dmax or today).year)+1))
-        default_year = int((dmax or today).year); default_month = int((dmax or today).month)
-    else:
-        years=[today.year]; default_year=today.year; default_month=today.month
+    # Unduh hasil
+    st.divider()
+    st.subheader("Unduh Hasil")
+    csv_bytes = result_display.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Unduh CSV", data=csv_bytes, file_name="rekonsiliasi_payment.csv", mime="text/csv")
 
-    bulan_id = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
-    year_sel = st.selectbox("Tahun", years, index=years.index(default_year))
-    month_sel_name = st.selectbox("Bulan", bulan_id, index=default_month-1)
-    month_sel = bulan_id.index(month_sel_name)+1
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+        result_display.to_excel(writer, sheet_name="Rekonsiliasi", index=False)
+    st.download_button(
+        "Unduh Excel",
+        data=xlsx_buf.getvalue(),
+        file_name="rekonsiliasi_payment.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-# =========================
-# Main: HANYA TABEL UTAMA
-# =========================
-if not upl or df is None or df.empty:
-    st.stop()
+    with st.expander("Aturan & Catatan"):
+        st.markdown(
+            """
+**Aturan Kategori**
+- Cash → H mengandung `cash`
+- Prepaid BRI → H `prepaid-bri`
+- Prepaid BNI → H `prepaid-bni`
+- Prepaid Mandiri → H `prepaid-mandiri`
+- Prepaid BCA → H `prepaid-bca`
+- SKPT → H `skpt`
+- IFCS → H `ifcs`
+- Reedem → H `reedem`
+- ESPAY → H `finpay` **dan** AA diawali `esp`
+- Finnet → H `finpay` **dan** AA **tidak** diawali `esp`
+- **Total** = jumlah semua kategori.
 
-df_valid = df[df["B"].notna()].copy()
-df_valid["Tanggal_ts"] = pd.to_datetime(df_valid["B"], errors="coerce")
-df_month = df_valid[
-    (df_valid["Tanggal_ts"].dt.year == year_sel) &
-    (df_valid["Tanggal_ts"].dt.month == month_sel)
-].copy()
+**Catatan Implementasi**
+- `Tanggal` diparse dari kolom B lalu diambil bagian harinya (jam diabaikan).
+- Amount default dari kolom **K**, bisa diubah jika header/posisi berbeda.
+- Default *group by* per `Tanggal`. Tambah kolom lain bila perlu.
+"""
+        )
 
-daily = build_daily_table(df_month, year_sel, month_sel)
-subtotal = daily[CHANNEL_COLS+["Total"]].sum(numeric_only=True)
-daily_with_sub = pd.concat([daily, pd.DataFrame([{"Tanggal":"Sub Total", **subtotal.to_dict()}])], ignore_index=True)
 
-st.dataframe(df_format_id(daily_with_sub, CHANNEL_COLS+["Total"], 0), use_container_width=True)
+if __name__ == "__main__":
+    main()
+
+# README.md
+# Rekonsiliasi Payment Report (Streamlit)
+Aplikasi Streamlit untuk rekonsiliasi payment report dari Excel.
+
+## Fitur
+- Upload Excel/CSV.
+- Parse **Tanggal** dari **kolom B** (jam diabaikan), kolom ditempatkan paling kiri.
+- Amount default dari **kolom K**.
+- Kategori: Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY, Finnet.
+- *Group by* default per **Tanggal**, dapat ditambah kolom lain.
+- Ekspor CSV/XLSX.
+
+## Jalankan Lokal
+```bash
+pip install -r requirements.txt
+streamlit run app.py
