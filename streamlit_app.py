@@ -1,14 +1,4 @@
-# =========================================
-# path: requirements.txt
-# =========================================
-streamlit>=1.33
-pandas>=2.2
-openpyxl>=3.1
-xlsxwriter>=3.1
-
-# =========================================
 # path: streamlit_app.py
-# =========================================
 import io
 from collections import OrderedDict
 from typing import List, Optional, Tuple
@@ -18,7 +8,7 @@ import streamlit as st
 
 
 def _default_by_position(cols: List[str], pos0: int) -> Optional[str]:
-    """Kenapa: file user pakai acuan posisi Excel (B/H/K/AA)."""
+    """Gunakan posisi Excel 0-based: B=1, H=7, K=10, AA=26."""
     return cols[pos0] if len(cols) > pos0 else None
 
 
@@ -55,7 +45,7 @@ def reconcile(
     amount_col: str,
     group_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Kenapa: satukan aturan ke agregasi, minimal error surface."""
+    """Agregasi amount per kategori; wajibkan 'Tanggal' di group_cols oleh pemanggil."""
     if col_h not in df.columns:
         raise ValueError(f"Kolom H tidak ditemukan: {col_h}")
     if col_aa and col_aa not in df.columns:
@@ -87,13 +77,10 @@ def reconcile(
 
 
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    """
-    Coba tulis XLSX dengan xlsxwriter → openpyxl.
-    Return: (bytes, engine_dipakai, error_message)
-    """
-    buf = io.BytesIO()
+    """Coba tulis XLSX; prioritas xlsxwriter → openpyxl. Matikan tombol bila dua2nya tak ada."""
     for engine in ("xlsxwriter", "openpyxl"):
         try:
+            buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine=engine) as writer:
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
             return buf.getvalue(), engine, None
@@ -102,7 +89,7 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
             continue
         except Exception as e:
             return None, None, f"Gagal menulis Excel dengan {engine}: {e}"
-    return None, None, "Tidak ada engine Excel yang tersedia (xlsxwriter/openpyxl)."
+    return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl). Tambahkan ke requirements."
 
 
 def main() -> None:
@@ -137,7 +124,7 @@ def main() -> None:
 
     st.sidebar.subheader("Pengaturan Kolom")
 
-    # B → Tanggal (date only, di paling kiri)
+    # Kolom B → Tanggal (date only, jadi kolom paling kiri)
     idx_b = cols.index(default_b) if default_b in cols else 0
     col_b = st.sidebar.selectbox("Kolom B (Tanggal: berisi tanggal+jam)", cols, index=idx_b)
     tanggal_series = pd.to_datetime(df[col_b], errors="coerce").dt.date
@@ -145,17 +132,17 @@ def main() -> None:
         df.drop(columns=["Tanggal"], inplace=True)
     df.insert(0, "Tanggal", tanggal_series)
 
-    # H (kategori)
+    # Kolom H (kategori)
     idx_h = list(df.columns).index(default_h) if default_h in df.columns else 1
     col_h = st.sidebar.selectbox("Kolom H (Kategori)", list(df.columns), index=idx_h)
 
-    # AA (opsional)
+    # Kolom AA (opsional)
     aa_options = ["<tanpa kolom AA>"] + list(df.columns)
     idx_aa = 0 if default_aa not in df.columns else aa_options.index(default_aa)
     sel_aa = st.sidebar.selectbox("Kolom AA (Referensi, opsional)", aa_options, index=idx_aa)
     col_aa = None if sel_aa == "<tanpa kolom AA>" else sel_aa
 
-    # K (amount) → kunci bila ada
+    # Kolom K (amount) → kunci bila ada
     if default_k in df.columns:
         amount_col = default_k
         st.sidebar.text_input("Kolom K (Amount, dikunci)", value=amount_col, disabled=True)
@@ -163,13 +150,12 @@ def main() -> None:
         amount_candidates = list(df.select_dtypes(include="number").columns) or list(df.columns)
         amount_col = st.sidebar.selectbox("Kolom Amount (K tidak ditemukan, pilih manual)", amount_candidates, index=0)
 
-    # Group by: wajib per Tanggal + tambahan opsional
+    # Group by: wajib Tanggal + tambahan opsional
     extra_group_opts = [c for c in df.columns if c not in {"Tanggal", amount_col}]
     extra_groups = st.sidebar.multiselect("Tambahan Group By (opsional)", options=extra_group_opts, default=[])
     group_cols = ["Tanggal"] + extra_groups
 
-    # ——— Tanpa preview data ———
-
+    # Tanpa preview data — langsung hasil
     with st.spinner("Menghitung rekonsiliasi..."):
         try:
             result = reconcile(df, col_h=col_h, col_aa=col_aa, amount_col=amount_col, group_cols=group_cols)
@@ -186,32 +172,31 @@ def main() -> None:
     st.divider()
     st.subheader("Unduh Hasil")
 
-    # CSV selalu tersedia
+    # CSV selalu
     csv_bytes = result_display.to_csv(index=False).encode("utf-8-sig")
     st.download_button("Unduh CSV", data=csv_bytes, file_name="rekonsiliasi_payment.csv", mime="text/csv")
 
-    # XLSX dengan fallback engine
+    # XLSX fallback
     excel_bytes, engine_used, err_msg = _to_excel_bytes(result_display, sheet_name="Rekonsiliasi")
     if excel_bytes:
         st.download_button(
-            f"Unduh Excel (.xlsx)  • engine: {engine_used}",
+            f"Unduh Excel (.xlsx) • engine: {engine_used}",
             data=excel_bytes,
             file_name="rekonsiliasi_payment.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
         st.warning(
-            "Ekspor Excel dinonaktifkan karena engine tidak tersedia.\n"
-            "Tambahkan ke **requirements.txt**: `xlsxwriter>=3.1` atau `openpyxl>=3.1`."
-            + (f"\nDetail: {err_msg}" if err_msg else "")
+            "Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` ke requirements. "
+            + (f"Detail: {err_msg}" if err_msg else "")
         )
 
     with st.expander("Aturan & Catatan"):
         st.markdown(
             """
 **Kategori**
-- Cash → H mengandung `cash`
-- Prepaid BRI/BNI/Mandiri/BCA → H mengandung `prepaid-...`
+- Cash → H `cash`
+- Prepaid BRI/BNI/Mandiri/BCA → H `prepaid-...`
 - SKPT → H `skpt`
 - IFCS → H `ifcs`
 - Reedem → H `reedem`
@@ -220,9 +205,8 @@ def main() -> None:
 - **Total** = penjumlahan semua kolom kategori.
 
 **Catatan**
-- `Tanggal` diparse dari kolom **B** (jam diabaikan) dan ditempatkan paling kiri.
-- Amount default dari **K**.
-- Tombol Excel aktif jika `xlsxwriter` atau `openpyxl` tersedia di environment.
+- `Tanggal` diparse dari kolom **B** (jam diabaikan) dan diletakkan paling kiri.
+- Amount default dari **K** (dikunci bila kolom ada).
 """
         )
 
