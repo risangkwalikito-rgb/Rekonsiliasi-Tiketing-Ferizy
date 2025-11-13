@@ -27,7 +27,7 @@ def _startswith_token(series: pd.Series, prefix: str) -> pd.Series:
     return series.fillna("").astype(str).str.lower().str.startswith(prefix)
 
 
-# Catatan: dukung "redeem" & "reedem"
+# Dukung "redeem" & "reedem"
 CATEGORY_RULES = OrderedDict(
     [
         ("Cash", lambda H, AA: _contains_token(H, "cash")),
@@ -47,10 +47,7 @@ CATEGORY_RULES = OrderedDict(
 def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
-        raise ValueError(
-            "Kolom wajib tidak ditemukan: " + ", ".join(missing) + ". "
-            "Pastikan header persis sesuai permintaan."
-        )
+        raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
 
 
 def reconcile(
@@ -93,7 +90,7 @@ def compute_bca_nonbca_from_raw(
     amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
 
     is_finpay = t.str.contains("finpay", na=False)
-    is_bca_tag = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
+    is_bca_tag = s.str_contains("vabcaespay", case=False, na=False) | s.str_contains("bluespay", case=False, na=False)
 
     df_tmp = df.copy()
     df_tmp["_amt"] = amt
@@ -123,13 +120,23 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl). Tambahkan ke requirements."
 
 
+def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_col: str = "Tanggal") -> pd.DataFrame:
+    """Tambahkan baris Subtotal (penjumlahan kolom numerik)."""
+    numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
+    totals = df_display[numeric_cols].sum()
+    subtotal = {c: (totals[c] if c in totals else None) for c in df_display.columns}
+    subtotal[date_col] = label
+    return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
     st.title("Rekonsiliasi Payment Report")
 
-    up = st.file_uploader("Upload Excel (.xlsx/.xls) atau CSV", type=["xlsx", "xls", "csv"])
+    # Sidebar: uploader + periode
+    up = st.sidebar.file_uploader("Upload Excel (.xlsx/.xls) atau CSV", type=["xlsx", "xls", "csv"])
     if not up:
-        st.info("Silakan upload file terlebih dahulu.")
+        st.info("Silakan upload file di panel kiri.")
         return
 
     # Sheet pertama
@@ -137,35 +144,35 @@ def main() -> None:
         xls = pd.ExcelFile(up)
         sheet_name = xls.sheet_names[0]
         df = xls.parse(sheet_name)
-        st.caption(f"Sheet dipakai: **{sheet_name}** (otomatis sheet pertama).")
+        st.sidebar.caption(f"Sheet dipakai: **{sheet_name}** (otomatis sheet pertama).")
     else:
         df = pd.read_csv(up)
-        st.caption("File CSV terbaca.")
+        st.sidebar.caption("File CSV terbaca.")
 
     if df.empty:
         st.warning("Data kosong.")
         return
 
-    # Validasi kolom wajib
+    # Validasi
     try:
         _ensure_required_columns(df)
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Kolom 'Tanggal' dari B (date-only) di paling kiri
+    # Tanggal dari B (date-only)
     tanggal_full = pd.to_datetime(df[COL_B], errors="coerce")
     if "Tanggal" in df.columns:
         df.drop(columns=["Tanggal"], inplace=True)
     df.insert(0, "Tanggal", tanggal_full.dt.date)
 
-    # Parameter Tahun & Bulan
+    # Sidebar: Tahun & Bulan
     years = sorted({d.year for d in tanggal_full.dropna().dt.date.unique()})
     if not years:
         st.error("Kolom tanggal tidak berisi nilai tanggal yang valid.")
         st.stop()
     default_year = max(years)
-    year = st.selectbox("Tahun", options=years, index=years.index(default_year))
+    year = st.sidebar.selectbox("Tahun", options=years, index=years.index(default_year))
 
     month_names = {
         1: "01 - Januari", 2: "02 - Februari", 3: "03 - Maret", 4: "04 - April",
@@ -174,7 +181,7 @@ def main() -> None:
     }
     months_in_year = sorted({d.month for d in tanggal_full.dropna() if d.year == year})
     default_month = months_in_year[-1] if months_in_year else 1
-    month = st.selectbox(
+    month = st.sidebar.selectbox(
         "Bulan",
         options=list(range(1, 13)),
         index=(default_month - 1) if 1 <= default_month <= 12 else 0,
@@ -189,7 +196,7 @@ def main() -> None:
         st.stop()
     df_period["Tanggal"] = pd.to_datetime(df_period[COL_B], errors="coerce").dt.date
 
-    # Rekon kategori (kolom utama)
+    # Rekon kategori
     with st.spinner("Menghitung rekonsiliasi kategori..."):
         result = reconcile(
             df=df_period,
@@ -199,51 +206,47 @@ def main() -> None:
             group_cols=["Tanggal"],
         )
 
-    # Tambahan: BCA / NON BCA (dari finpay + SOF ID)
+    # BCA / NON BCA (finpay + SOF ID)
     add_finpay = compute_bca_nonbca_from_raw(
         df=df_period, group_cols=["Tanggal"], type_col=COL_H, sof_col=COL_X, amount_col=COL_K
     )
     result = result.join(add_finpay, how="left").fillna(0)
 
-    # NON = jumlah kategori non-finpay dari hasil rekonsiliasi
-    non_components = [
-        "Cash",
-        "Prepaid BRI",
-        "Prepaid BNI",
-        "Prepaid Mandiri",
-        "Prepaid BCA",
-        "SKPT",
-        "IFCS",
-        "Reedem",
-    ]
+    # NON = jumlah kategori non-finpay
+    non_components = ["Cash", "Prepaid BRI", "Prepaid BNI", "Prepaid Mandiri", "Prepaid BCA", "SKPT", "IFCS", "Reedem"]
     existing = [c for c in non_components if c in result.columns]
     result["NON"] = result[existing].sum(axis=1) if existing else 0
 
-    # === TOTAL baru: BCA + NON BCA + NON ===
+    # TOTAL (baru) = BCA + NON BCA + NON
     for need in ["BCA", "NON BCA", "NON"]:
         if need not in result.columns:
             result[need] = 0
     result["TOTAL"] = result[["BCA", "NON BCA", "NON"]].sum(axis=1)
 
-    # Urutkan kolom: …, Total, BCA, NON BCA, NON, TOTAL
+    # S E L I S I H  = TOTAL − Total (audit)
+    # (positif: TOTAL lebih besar dari Total kategori; negatif: sebaliknya)
+    result["Selisih"] = result["TOTAL"] - result["Total"]
+
+    # Urut kolom: …, Total, BCA, NON BCA, NON, TOTAL, Selisih
     cols = list(result.columns)
-    for c in ["BCA", "NON BCA", "NON", "TOTAL"]:
+    for c in ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]:
         if c not in cols:
             cols.append(c)
     if "Total" in cols:
-        for c in ["BCA", "NON BCA", "NON", "TOTAL"]:
+        for c in ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]:
             if c in cols:
                 cols.remove(c)
         insert_pos = cols.index("Total") + 1
-        cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON", "TOTAL"]
+        cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]
     result = result[cols]
 
-    # Tampilkan
+    # Tampilkan + Subtotal
     st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
     result_display = result.reset_index()
     if "Tanggal" in result_display.columns:
         result_display["Tanggal"] = pd.to_datetime(result_display["Tanggal"]).dt.strftime("%d/%m/%Y")
         result_display = result_display[["Tanggal"] + [c for c in result_display.columns if c != "Tanggal"]]
+    result_display = _add_subtotal_row(result_display, label="Subtotal", date_col="Tanggal")
     st.dataframe(result_display, use_container_width=True)
 
     # Unduh
@@ -270,23 +273,16 @@ def main() -> None:
             + (f"\nDetail: {err_msg}" if err_msg else "")
         )
 
-    with st.expander("Aturan & Kolom Wajib"):
+    with st.expander("Aturan, Kolom Wajib & Audit"):
         st.markdown(
             f"""
-**Kolom Wajib (header persis):**
-- H → **{COL_H}**
-- B → **{COL_B}**
-- AA → **{COL_AA}**
-- K → **{COL_K}**
-- X → **{COL_X}**
+**Kolom Wajib:** H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**.
 
-**BCA/NON BCA/NON**
-- **BCA**: TIPE PEMBAYARAN `finpay` & `SOF ID` mengandung `vabcaespay`/`bluespay`
-- **NON BCA**: TIPE PEMBAYARAN `finpay` & `SOF ID` selain itu
+**Tambahan Kolom:**
+- **BCA/NON BCA**: dari `finpay` + `SOF ID` (`vabcaespay|bluespay` = BCA; selainnya = NON BCA)
 - **NON**: jumlah kategori non-finpay (Cash, semua Prepaid, SKPT, IFCS, Reed(e)m)
-
-**TOTAL baru**
-- **TOTAL** = **BCA + NON BCA + NON** (diletakkan di kanan kolom NON).
+- **TOTAL** = **BCA + NON BCA + NON**
+- **Selisih** = **TOTAL − Total** (kontrol konsistensi)
 """
         )
 
