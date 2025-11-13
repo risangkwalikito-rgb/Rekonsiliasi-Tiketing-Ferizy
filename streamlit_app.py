@@ -1,6 +1,7 @@
 # path: streamlit_app.py
 import io
 import zipfile
+from datetime import date
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
@@ -8,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 
-# === Kolom wajib (header harus persis) ===
+# === Kolom wajib (header persis) ===
 COL_H = "TIPE PEMBAYARAN"     # H
 COL_B = "TANGGAL PEMBAYARAN"  # B
 COL_AA = "REF NO"             # AA
@@ -142,25 +143,31 @@ _VALID_EXTS = (".xlsx", ".xls", ".csv")
 def _read_first_sheet_excel(content: bytes) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(content))
     sheet_name = xls.sheet_names[0]
-    return xls.parse(sheet_name)
+    # why: hemat memori – baca hanya kolom wajib jika ada
+    try:
+        return xls.parse(sheet_name, usecols=REQUIRED_COLS)
+    except Exception:
+        df = xls.parse(sheet_name)
+        return df[[c for c in REQUIRED_COLS if c in df.columns]]
 
 def _read_csv_bytes(content: bytes) -> pd.DataFrame:
-    return pd.read_csv(io.BytesIO(content))
+    try:
+        return pd.read_csv(io.BytesIO(content), usecols=REQUIRED_COLS)
+    except Exception:
+        df = pd.read_csv(io.BytesIO(content))
+        return df[[c for c in REQUIRED_COLS if c in df.columns]]
 
-def _load_many(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """
-    Gabungkan banyak file & ZIP.
-    Return: (df_gabungan, used_labels, skipped_labels)
-    """
+def _load_many(uploaded_files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """Gabungkan banyak file & ZIP. Return: (df_gabungan, used_labels, skipped_labels)."""
     frames: List[pd.DataFrame] = []
     used, skipped = [], []
 
     for f in uploaded_files:
-        name = f.name
         try:
             data = f.getvalue()
         except Exception:
             data = f.read()
+        name = f.name
 
         if name.lower().endswith(".zip"):
             try:
@@ -178,7 +185,6 @@ def _load_many(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFil
                                 df_tmp = _read_first_sheet_excel(content)
                             else:
                                 df_tmp = _read_csv_bytes(content)
-                            # validasi kolom wajib per file
                             if all(c in df_tmp.columns for c in REQUIRED_COLS):
                                 frames.append(df_tmp)
                                 used.append(f"{name}::{fname}")
@@ -188,7 +194,7 @@ def _load_many(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFil
                             skipped.append(f"{name}::{fname} (error: {e})")
             except Exception as e:
                 skipped.append(f"{name} (ZIP rusak: {e})")
-        elif name.lower().endswith((".xlsx", ".xls", ".csv")):
+        elif name.lower().endswith(_VALID_EXTS):
             try:
                 if name.lower().endswith((".xlsx", ".xls")):
                     df_tmp = _read_first_sheet_excel(data)
@@ -214,7 +220,23 @@ def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
     st.title("Rekonsiliasi Payment Report")
 
-    # Sidebar: uploader multi-file/ZIP + periode + opsi highlight
+    # === Sidebar: Filter selalu tampil ===
+    today = date.today()
+    years_options = list(range(today.year - 5, today.year + 6))
+    default_year = st.session_state.get("year", today.year)
+    default_month = st.session_state.get("month", today.month)
+
+    year = st.sidebar.selectbox("Tahun", options=years_options, index=years_options.index(default_year))
+    month_names = {
+        1: "01 - Januari", 2: "02 - Februari", 3: "03 - Maret", 4: "04 - April",
+        5: "05 - Mei", 6: "06 - Juni", 7: "07 - Juli", 8: "08 - Agustus",
+        9: "09 - September", 10: "10 - Oktober", 11: "11 - November", 12: "12 - Desember",
+    }
+    month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=max(0, min(11, default_month - 1)), format_func=lambda m: month_names[m])
+    st.session_state["year"] = year
+    st.session_state["month"] = month
+
+    # Uploader multi file / ZIP + opsi highlight
     up_files = st.sidebar.file_uploader(
         "Upload ZIP / beberapa Excel (.xlsx/.xls) / CSV",
         type=["zip", "xlsx", "xls", "csv"],
@@ -250,29 +272,7 @@ def main() -> None:
         df.drop(columns=["Tanggal"], inplace=True)
     df.insert(0, "Tanggal", tanggal_full.dt.date)
 
-    # Sidebar: Tahun & Bulan
-    years = sorted({d.year for d in tanggal_full.dropna().dt.date.unique()})
-    if not years:
-        st.error("Kolom tanggal tidak berisi nilai tanggal yang valid.")
-        st.stop()
-    default_year = max(years)
-    year = st.sidebar.selectbox("Tahun", options=years, index=years.index(default_year))
-
-    month_names = {
-        1: "01 - Januari", 2: "02 - Februari", 3: "03 - Maret", 4: "04 - April",
-        5: "05 - Mei", 6: "06 - Juni", 7: "07 - Juli", 8: "08 - Agustus",
-        9: "09 - September", 10: "10 - Oktober", 11: "11 - November", 12: "12 - Desember",
-    }
-    months_in_year = sorted({d.month for d in tanggal_full.dropna() if d.year == year})
-    default_month = months_in_year[-1] if months_in_year else 1
-    month = st.sidebar.selectbox(
-        "Bulan",
-        options=list(range(1, 13)),
-        index=(default_month - 1) if 1 <= default_month <= 12 else 0,
-        format_func=lambda m: month_names[m],
-    )
-
-    # Filter periode
+    # Filter periode berdasarkan pilihan sidebar (selalu ada)
     periode_mask = (tanggal_full.dt.year == year) & (tanggal_full.dt.month == month)
     df_period = df.loc[periode_mask].copy()
     if df_period.empty:
@@ -293,7 +293,7 @@ def main() -> None:
     existing = [c for c in non_components if c in result.columns]
     result["NON"] = result[existing].sum(axis=1) if existing else 0
 
-    # TOTAL (baru) = BCA + NON BCA + NON
+    # TOTAL = BCA + NON BCA + NON
     for need in ["BCA", "NON BCA", "NON"]:
         if need not in result.columns:
             result[need] = 0
@@ -302,7 +302,7 @@ def main() -> None:
     # Selisih = TOTAL − Total
     result["Selisih"] = result["TOTAL"] - result["Total"]
 
-    # Urut kolom: …, Total, BCA, NON BCA, NON, TOTAL, Selisih
+    # Urut kolom
     cols = list(result.columns)
     for c in ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]:
         if c not in cols:
@@ -315,7 +315,7 @@ def main() -> None:
         cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]
     result = result[cols]
 
-    # === Tampilkan + Subtotal + Format angka bulat ===
+    # Tampilkan + Subtotal + Format angka bulat
     st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
     result_display = result.reset_index()
     if "Tanggal" in result_display.columns:
@@ -323,7 +323,6 @@ def main() -> None:
         result_display = result_display[["Tanggal"] + [c for c in result_display.columns if c != "Tanggal"]]
     result_display = _add_subtotal_row(result_display, label="Subtotal", date_col="Tanggal")
 
-    # Bulatkan angka untuk tampilan & ekspor
     numeric_cols = result_display.select_dtypes(include="number").columns
     result_display[numeric_cols] = result_display[numeric_cols].round(0).astype("Int64")
 
@@ -358,9 +357,9 @@ def main() -> None:
             f"""
 **Kolom Wajib:** H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**.
 
-**Input:** Bisa banyak file (`.xlsx/.xls/.csv`) atau **ZIP** berisi file-file tsb. Excel selalu pakai **sheet pertama**.
+**Input:** Bisa banyak file (`.xlsx/.xls/.csv`) atau **ZIP**. Excel selalu pakai **sheet pertama**.
 
-**Tambahan Kolom**
+**Kolom Tambahan**
 - **BCA/NON BCA**: dari `finpay` + `SOF ID` (`vabcaespay|bluespay` = BCA; selainnya = NON BCA)
 - **NON**: jumlah kategori non-finpay (Cash, semua Prepaid, SKPT, IFCS, Reed(e)m)
 - **TOTAL** = **BCA + NON BCA + NON**
