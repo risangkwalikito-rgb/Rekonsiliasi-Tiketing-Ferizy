@@ -27,7 +27,7 @@ def _startswith_token(series: pd.Series, prefix: str) -> pd.Series:
     return series.fillna("").astype(str).str.lower().str.startswith(prefix)
 
 
-# Catatan: “redeem/reedem” keduanya didukung
+# Catatan: dukung "redeem" & "reedem"
 CATEGORY_RULES = OrderedDict(
     [
         ("Cash", lambda H, AA: _contains_token(H, "cash")),
@@ -70,7 +70,7 @@ def reconcile(
         for name, rule in CATEGORY_RULES.items():
             mask = rule(H, AA)
             grp = df.loc[mask, group_cols].copy()
-            grp["_amt"] = amount.loc[mask].values  # kenapa: hindari konflik nama
+            grp["_amt"] = amount.loc[mask].values  # why: hindari konflik nama
             pieces[name] = grp.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
         result = pd.concat(pieces, axis=1).fillna(0)
     else:
@@ -98,21 +98,11 @@ def compute_bca_nonbca_from_raw(
     df_tmp = df.copy()
     df_tmp["_amt"] = amt
 
-    # BCA: finpay & (vabcaespay|bluespay)
     sub_bca = df_tmp.loc[is_finpay & is_bca_tag, group_cols + ["_amt"]]
-    ser_bca = (
-        sub_bca.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
-        if not sub_bca.empty
-        else pd.Series(dtype="float64")
-    )
+    ser_bca = sub_bca.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1) if not sub_bca.empty else pd.Series(dtype="float64")
 
-    # NON BCA: finpay & ~(vabcaespay|bluespay)
     sub_nonbca = df_tmp.loc[is_finpay & (~is_bca_tag), group_cols + ["_amt"]]
-    ser_nonbca = (
-        sub_nonbca.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
-        if not sub_nonbca.empty
-        else pd.Series(dtype="float64")
-    )
+    ser_nonbca = sub_nonbca.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1) if not sub_nonbca.empty else pd.Series(dtype="float64")
 
     out = pd.concat({"BCA": ser_bca, "NON BCA": ser_nonbca}, axis=1).fillna(0)
     return out
@@ -142,7 +132,7 @@ def main() -> None:
         st.info("Silakan upload file terlebih dahulu.")
         return
 
-    # Sheet pertama saja
+    # Sheet pertama
     if up.name.lower().endswith((".xlsx", ".xls")):
         xls = pd.ExcelFile(up)
         sheet_name = xls.sheet_names[0]
@@ -163,7 +153,7 @@ def main() -> None:
         st.error(str(e))
         st.stop()
 
-    # Tanggal (date-only) di paling kiri
+    # Kolom 'Tanggal' dari B (date-only) di paling kiri
     tanggal_full = pd.to_datetime(df[COL_B], errors="coerce")
     if "Tanggal" in df.columns:
         df.drop(columns=["Tanggal"], inplace=True)
@@ -224,23 +214,28 @@ def main() -> None:
         "Prepaid BCA",
         "SKPT",
         "IFCS",
-        "Reedem",  # sudah menangani redeem/reedem di rule
+        "Reedem",
     ]
-    # Pastikan kolom yang ada saja yang dijumlah
     existing = [c for c in non_components if c in result.columns]
     result["NON"] = result[existing].sum(axis=1) if existing else 0
 
-    # Urutkan kolom: …, Total, BCA, NON BCA, NON
+    # === TOTAL baru: BCA + NON BCA + NON ===
+    for need in ["BCA", "NON BCA", "NON"]:
+        if need not in result.columns:
+            result[need] = 0
+    result["TOTAL"] = result[["BCA", "NON BCA", "NON"]].sum(axis=1)
+
+    # Urutkan kolom: …, Total, BCA, NON BCA, NON, TOTAL
     cols = list(result.columns)
-    for c in ["BCA", "NON BCA", "NON"]:
+    for c in ["BCA", "NON BCA", "NON", "TOTAL"]:
         if c not in cols:
             cols.append(c)
     if "Total" in cols:
-        for c in ["BCA", "NON BCA", "NON"]:
+        for c in ["BCA", "NON BCA", "NON", "TOTAL"]:
             if c in cols:
                 cols.remove(c)
         insert_pos = cols.index("Total") + 1
-        cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON"]
+        cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON", "TOTAL"]
     result = result[cols]
 
     # Tampilkan
@@ -288,7 +283,10 @@ def main() -> None:
 **BCA/NON BCA/NON**
 - **BCA**: TIPE PEMBAYARAN `finpay` & `SOF ID` mengandung `vabcaespay`/`bluespay`
 - **NON BCA**: TIPE PEMBAYARAN `finpay` & `SOF ID` selain itu
-- **NON**: penjumlahan kolom kategori non-finpay (Cash, semua Prepaid, SKPT, IFCS, Reed(e)m)
+- **NON**: jumlah kategori non-finpay (Cash, semua Prepaid, SKPT, IFCS, Reed(e)m)
+
+**TOTAL baru**
+- **TOTAL** = **BCA + NON BCA + NON** (diletakkan di kanan kolom NON).
 """
         )
 
