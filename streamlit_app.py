@@ -82,29 +82,44 @@ def reconcile(
     return result
 
 
-def compute_bca_columns(
+def compute_bca_non_columns(
     df: pd.DataFrame,
     group_cols: List[str],
+    type_col: str,
     sof_col: str,
     amount_col: str,
 ) -> pd.DataFrame:
-    """Hitung BCA, NON BCA, NON per group; partisi mutual-exclusive."""
+    """
+    Hitung kolom BCA / NON BCA / NON sesuai ralat:
+      - NON      : tipe cash/prepaid/skpt/ifcs/reedem (bukan finpay)
+      - BCA      : tipe finpay & SOF ID ∈ {vabcaespay, bluespay}
+      - NON BCA  : tipe finpay & SOF ID ∉ {vabcaespay, bluespay}
+    """
+    t = df[type_col].fillna("").astype(str).str.strip().str.lower()
     s = df[sof_col].fillna("").astype(str).str.strip().str.lower()
-    amt_col = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
-    df = df.copy()
-    df["_amt"] = amt_col
+    amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
 
-    mask_bca = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
-    mask_non = s.eq("non")
-    mask_nonbca = ~(mask_bca | mask_non)
+    is_finpay = t.str.contains("finpay", na=False)
+    is_bca_tag = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
+
+    # NON = kanal non-finpay yang termasuk daftar berikut
+    is_non_candidates = (
+        t.str.contains("cash", na=False)
+        | t.str.contains("prepaid", na=False)
+        | t.str.contains("skpt", na=False)
+        | t.str.contains("ifcs", na=False)
+        | t.str.contains("reedem", na=False)
+    )
+    mask_non = is_non_candidates & (~is_finpay)
+    mask_bca = is_finpay & is_bca_tag
+    mask_nonbca = is_finpay & (~is_bca_tag)
+
+    df_tmp = df.copy()
+    df_tmp["_amt"] = amt
 
     agg = {}
-    for col_name, mask in [
-        ("BCA", mask_bca),
-        ("NON", mask_non),
-        ("NON BCA", mask_nonbca),
-    ]:
-        sub = df.loc[mask, group_cols + ["_amt"]]
+    for col_name, mask in [("BCA", mask_bca), ("NON BCA", mask_nonbca), ("NON", mask_non)]:
+        sub = df_tmp.loc[mask, group_cols + ["_amt"]]
         if sub.empty:
             agg[col_name] = pd.Series(dtype="float64")
         else:
@@ -183,7 +198,7 @@ def main() -> None:
     month = st.selectbox(
         "Bulan",
         options=list(range(1, 13)),
-        index=(default_month - 1) if 1 <= default_month <= 12 else 0,  # FIX: gunakan default_month
+        index=(default_month - 1) if 1 <= default_month <= 12 else 0,
         format_func=lambda m: month_names[m],
     )
 
@@ -209,11 +224,12 @@ def main() -> None:
             st.error(f"Gagal merekonsiliasi kategori: {e}")
             st.stop()
 
-    # Hitung kolom tambahan (BCA, NON, NON BCA) per Tanggal
+    # Hitung kolom BCA/NON BCA/NON (aturan baru) per Tanggal
     try:
-        add_cols = compute_bca_columns(
+        add_cols = compute_bca_non_columns(
             df=df_period,
             group_cols=["Tanggal"],
+            type_col=COL_H,
             sof_col=COL_X,
             amount_col=COL_K,
         )
@@ -277,10 +293,10 @@ def main() -> None:
 **Kategori (H/AA):**
 Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY (finpay+AA diawali esp), Finnet (finpay+AA bukan esp).
 
-**Kolom Tambahan (X/SOF ID):**
-- **BCA**: berisi `vabcaespay` atau `bluespay`
-- **NON**: bernilai `NON`
-- **NON BCA**: selain `vabcaespay`, `bluespay`, dan `NON`
+**BCA / NON BCA / NON (H + X):**
+- **NON**      : `cash`, `prepaid*`, `skpt`, `ifcs`, `reedem` (bukan `finpay`)
+- **BCA**      : `finpay` & SOF ID berisi `vabcaespay` atau `bluespay`
+- **NON BCA**  : `finpay` & SOF ID selain `vabcaespay`/`bluespay`
 """
         )
 
